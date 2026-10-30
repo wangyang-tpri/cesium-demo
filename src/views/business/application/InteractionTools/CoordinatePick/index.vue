@@ -1,289 +1,132 @@
 <script setup lang="ts">
-import { ref, provide, onBeforeUnmount } from "vue";
-import * as Cesium from "cesium";
-import SplitViewer from "@/components/base/SplitViewer.vue";
-import { useCesiumViewer } from "@/hooks/useCesiumViewer";
-import { useCodeExplain } from "@/hooks/useCodeExplain";
+import * as Cesium from 'cesium';
+import { onBeforeUnmount, provide, ref, shallowRef, watch } from 'vue';
+import SplitViewer from '@/components/base/SplitViewer.vue';
+import { useSpatialAnalysis } from '@/hooks/useSpatialAnalysis';
+import { useCodeExplain } from '@/hooks/useCodeExplain';
+import type { PickMode, PickSource } from '@/utils/mapInteraction';
 
 const containerRef = ref<HTMLDivElement | null>(null);
-provide("splitViewerContainerRef", containerRef);
-
-const { viewer } = useCesiumViewer(containerRef, {
-  baseLayer: "tianditu-img",
-  camera: { position: [108.94, 34.2, 30000], pitch: -55 },
-});
-
-const activeFeature = ref<"pick" | "clear">("pick");
-const statusText = ref(
-  "坐标拾取：点击「开始拾取」，在地图上点击任意位置获取坐标信息。"
-);
-
-interface PickRecord {
-  id: number;
-  longitude: number;
-  latitude: number;
-  height: number;
-  screenX: number;
-  screenY: number;
-  cartesian: Cesium.Cartesian3;
-}
-
-const pickRecords = ref<PickRecord[]>([]);
-let pickIdCounter = 0;
-let picking = false;
-let handler: Cesium.ScreenSpaceEventHandler | null = null;
-let markerEntities: Cesium.Entity[] = [];
-
-function applyPick() {
-  activeFeature.value = "pick";
-  if (picking) {
-    stopPicking();
-    statusText.value = "已停止拾取，点击「开始拾取」重新开始。";
-    return;
-  }
-  startPicking();
-  statusText.value = "拾取模式已开启，点击地图任意位置获取坐标。";
-}
-
+provide('splitViewerContainerRef', containerRef);
+const activeFeature = ref('pick');
+const analysis = useSpatialAnalysis(containerRef, '开始拾取后点击地图，可选择地表或场景表面坐标。');
+const { viewer, ready, picking, statusText, terrainNote } = analysis;
+const pickMode = ref<PickMode>('ground');
+const modeOptions = [{ label: '地表坐标', value: 'ground' }, { label: '场景表面坐标', value: 'scene' }];
+const sourceNames: Record<PickSource, string> = { terrain: '渲染地形', ellipsoid: '零高程椭球', scene: '场景深度表面' };
+interface PickRecord { id: number; longitude: number; latitude: number; height: number;
+  screenX: number; screenY: number; cartesian: Cesium.Cartesian3; source: PickSource; entity: Cesium.Entity }
+const pickRecords = shallowRef<PickRecord[]>([]);
+let counter = 0;
+let copyGeneration = 0;
+let disposed = false;
+const showCopy = ref(false);
+const copyText = ref('');
 function startPicking() {
-  const v = viewer.value;
-  if (!v) return;
-  picking = true;
-  if (!handler)
-    handler = new Cesium.ScreenSpaceEventHandler(v.scene.canvas);
-  handler.setInputAction((click: any) => {
-    const cartesian = v.scene.pickPosition(click.position);
-    if (!cartesian) return;
-    const carto = Cesium.Cartographic.fromCartesian(cartesian);
-    const record: PickRecord = {
-      id: ++pickIdCounter,
-      longitude: Cesium.Math.toDegrees(carto.longitude),
-      latitude: Cesium.Math.toDegrees(carto.latitude),
-      height: carto.height,
-      screenX: click.position.x,
-      screenY: click.position.y,
-      cartesian,
-    };
-    pickRecords.value.unshift(record);
-    // 添加标记点
-    const entity = v.entities.add({
-      position: cartesian,
-      point: {
-        pixelSize: 10,
-        color: Cesium.Color.RED,
-        outlineColor: Cesium.Color.WHITE,
-        outlineWidth: 2,
-      },
-      label: {
-        text: `#${record.id}`,
-        font: "12px sans-serif",
-        pixelOffset: new Cesium.Cartesian2(0, -18),
-        fillColor: Cesium.Color.WHITE,
-        outlineColor: Cesium.Color.BLACK,
-        outlineWidth: 2,
-        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-      },
+  if (!ready.value) return;
+  viewer.value?.camera.cancelFlight();
+  analysis.pick((position, pixel, source) => {
+    if (pickRecords.value.length >= 200) { statusText.value = '最多保留 200 条记录，请删除部分记录或清除后继续'; return; }
+    const carto = Cesium.Cartographic.fromCartesian(position);
+    const id = ++counter;
+    const entity = analysis.add({ position,
+      point: { pixelSize: 10, color: Cesium.Color.RED, outlineColor: Cesium.Color.WHITE, outlineWidth: 2 },
+      label: { text: '#' + id, font: '12px sans-serif', pixelOffset: new Cesium.Cartesian2(0, -22),
+        fillColor: Cesium.Color.WHITE, outlineColor: Cesium.Color.BLACK, outlineWidth: 2, style: Cesium.LabelStyle.FILL_AND_OUTLINE },
     });
-    markerEntities.push(entity);
-    statusText.value = `已拾取 #${record.id}：经度 ${record.longitude.toFixed(
-      6
-    )}°, 纬度 ${record.latitude.toFixed(6)}°, 高程 ${record.height.toFixed(
-      2
-    )}m`;
-  }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    const record = { id, longitude: Cesium.Math.toDegrees(carto.longitude), latitude: Cesium.Math.toDegrees(carto.latitude),
+      height: carto.height, screenX: pixel.x, screenY: pixel.y, cartesian: position, source, entity };
+    pickRecords.value = [record, ...pickRecords.value];
+    statusText.value = '已拾取 #' + id + '：' + record.longitude.toFixed(6) + '°，' + record.latitude.toFixed(6) +
+      '°，椭球高 ' + record.height.toFixed(2) + 'm（' + sourceNames[source] + '）';
+  }, { mode: pickMode.value });
+  statusText.value = '拾取已开启，点击地面位置获取坐标';
 }
-
-function stopPicking() {
-  picking = false;
-  if (handler) {
-    handler.destroy();
-    handler = null;
+function applyPick() {
+  if (picking.value) { picking.value = false; statusText.value = '已停止拾取，记录保留'; }
+  else startPicking();
+}
+watch(pickMode, () => { if (picking.value) startPicking(); });
+function applyClear() {
+  copyGeneration++; analysis.clear(); viewer.value?.camera.cancelFlight();
+  pickRecords.value = []; counter = 0; showCopy.value = false;
+  statusText.value = '已清除所有拾取记录，拾取已停止';
+}
+function removeRecord(record: PickRecord) {
+  analysis.remove(record.entity); pickRecords.value = pickRecords.value.filter(r => r.id !== record.id);
+  statusText.value = '已删除记录 #' + record.id;
+}
+async function copyRecord(record: PickRecord) {
+  const generation = ++copyGeneration;
+  const valid = () => !disposed && generation === copyGeneration && pickRecords.value.some(r => r.id === record.id);
+  const text = record.longitude.toFixed(6) + ', ' + record.latitude.toFixed(6) + ', ' + record.height.toFixed(2);
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
+    await navigator.clipboard.writeText(text);
+    if (valid()) statusText.value = '已复制 #' + record.id + ' 坐标：' + text;
+  } catch {
+    if (!valid()) return;
+    copyText.value = text; showCopy.value = true;
+    statusText.value = '浏览器未允许自动复制，请在弹窗中选择并手动复制坐标';
   }
 }
-
-function applyClear() {
-  const v = viewer.value;
-  activeFeature.value = "clear";
-  stopPicking();
-  pickRecords.value = [];
-  pickIdCounter = 0;
-  if (v) markerEntities.forEach((e) => v.entities.remove(e));
-  markerEntities = [];
-  statusText.value = "已清除所有拾取记录，点击「开始拾取」重新开始。";
-}
-
-function copyRecord(record: PickRecord) {
-  const text = `${record.longitude.toFixed(6)}, ${record.latitude.toFixed(
-    6
-  )}, ${record.height.toFixed(2)}`;
-  navigator.clipboard.writeText(text).then(() => {
-    statusText.value = `已复制 #${record.id} 坐标到剪贴板：${text}`;
-  });
-}
-
 function flyToRecord(record: PickRecord) {
   const v = viewer.value;
   if (!v) return;
-  v.flyTo(
-    record.cartesian ? ({ position: record.cartesian } as any) : undefined,
-    {
-      duration: 1.5,
-      offset: new Cesium.HeadingPitchRange(0, -Cesium.Math.PI_OVER_TWO, 500),
-    }
-  );
-}
-
-onBeforeUnmount(() => {
-  stopPicking();
-  const v = viewer.value;
-  if (v) markerEntities.forEach((e) => v.entities.remove(e));
-});
-
-const codeMap: Record<"pick" | "clear", () => string> = {
-  pick: () => `// 1. 创建屏幕空间事件处理器
-const handler = new ScreenSpaceEventHandler(viewer.scene.canvas);
-
-// 2. 监听左键点击事件
-handler.setInputAction((click) => {
-  // 3. 从屏幕坐标获取三维空间坐标
-  const cartesian = viewer.scene.pickPosition(click.position);
-  if (!cartesian) return;
-
-  // 4. 笛卡尔坐标转地理坐标（经纬度弧度）
-  const carto = Cartographic.fromCartesian(cartesian);
-  const longitude = Math.toDegrees(carto.longitude);
-  const latitude = Math.toDegrees(carto.latitude);
-  const height = carto.height;
-
-  // 5. 添加标记点实体
-  viewer.entities.add({
-    position: cartesian,
-    point: { pixelSize: 10, color: Color.RED },
-    label: { text: '#' + id, pixelOffset: new Cartesian2(0, -18) },
+  picking.value = false;
+  v.camera.flyToBoundingSphere(new Cesium.BoundingSphere(record.cartesian, 1), {
+    offset: new Cesium.HeadingPitchRange(0, -Math.PI / 3, 1000), duration: 1.2,
   });
-}, ScreenSpaceEventType.LEFT_CLICK);`,
-  clear: () => `// 清除所有拾取记录和标记
-pickRecords = [];
-markerEntities.forEach(e => viewer.entities.remove(e));
-markerEntities = [];
-if (handler) { handler.destroy(); handler = null; }`,
-};
-
-const explainMap: Record<"pick" | "clear", () => string> = {
-  pick: () => `【原理】坐标拾取 = 屏幕事件 + 三维坐标转换 + 地理坐标提取：
-1. 使用 ScreenSpaceEventHandler 监听地图左键点击事件
-2. scene.pickPosition 从屏幕像素坐标获取三维笛卡尔坐标（含地形高程）
-3. Cartographic.fromCartesian 将笛卡尔坐标转换为地理坐标（经纬度弧度+高程）
-4. Math.toDegrees 将弧度转换为度数
-5. 添加 point + label 实体标记拾取位置
-6. 记录屏幕坐标(x,y)、地理坐标(经纬度)、高程、笛卡尔坐标
-
-【API】
-• ScreenSpaceEventHandler: 屏幕空间事件处理器
-• scene.pickPosition: 屏幕坐标转三维坐标（含地形）
-• Cartographic.fromCartesian: 笛卡尔转地理坐标
-• Math.toDegrees: 弧度转角度
-• Entity.point/label: 点和标签实体`,
-  clear: () => `【原理】清除 = 批量移除实体 + 重置数据 + 销毁事件处理器：
-1. 遍历 markerEntities，逐个移除标记点实体
-2. 重置 pickRecords、pickIdCounter 等数据
-3. 销毁 ScreenSpaceEventHandler，停止事件监听
-
-【要点】清除操作会移除所有标记和记录，不可撤销。`,
-};
-
-const { code, explanation } = useCodeExplain(
-  codeMap,
-  explainMap,
-  activeFeature
-);
+  statusText.value = '定位记录 #' + record.id + '，拾取已暂停';
+}
+onBeforeUnmount(() => { disposed = true; copyGeneration++; });
+const { code, explanation } = useCodeExplain({ pick: () => `// 地表模式优先使用射线拾取已渲染地形
+const ray = viewer.camera.getPickRay(pixel)
+const ground = viewer.scene.globe.pick(ray, viewer.scene)
+// 场景模式仅在支持深度拾取时使用 pickPosition，忽略工具自己的标记
+// 深度不可用则回退地表；仅椭球演示允许 pickEllipsoid
+// 定位使用真实 Cartesian3 包围球，而不是伪造 Entity
+viewer.camera.flyToBoundingSphere(new BoundingSphere(position, 1))` }, {
+  pick: () => `【坐标】经纬度为 WGS84，输出高度为椭球高，不等同于当地海拔。高程来自当前渲染精度，不能替代测量。
+【模式】地表坐标拾取地形；场景表面模式可拾取模型的深度表面，深度不可用时回退地表。每条记录明确显示来源。
+【屏幕坐标】相对于地图画布左上角的 CSS 像素；ECEF 为地心地固直角坐标，单位米。
+【交互】支持启停、复制、定位、单条删除和清除；复制受限时提供手动复制，最多保留 200 条记录。`,
+}, activeFeature);
 </script>
 
 <template>
   <div class="flex h-full flex-col gap-3 p-4">
     <div class="flex flex-wrap items-center gap-2">
-      <n-button
-        size="small"
-        :type="picking ? 'warning' : 'success'"
-        @click="applyPick"
-      >
-        {{ picking ? "停止拾取" : "开始拾取" }}
-      </n-button>
+      <n-button size="small" :type="picking ? 'warning' : 'success'" :disabled="!ready" @click="applyPick">{{ picking ? '停止拾取' : '开始拾取' }}</n-button>
+      <n-select v-model:value="pickMode" :options="modeOptions" size="small" style="width: 170px" />
       <n-button size="small" quaternary @click="applyClear">清除</n-button>
     </div>
-
-    <SplitViewer
-      :title="activeFeature"
-      :code="code"
-      :explanation="explanation"
-      :default-split-size="70"
-      storage-key="coordinate-pick-split"
-    >
+    <SplitViewer title="坐标拾取" :code="code" :explanation="explanation" storage-key="coordinate-pick-split">
       <template #scene-overlay>
-        <div
-          class="absolute left-3 top-3 z-10 max-w-[70%] rounded bg-black/60 px-3 py-1.5 text-xs text-white"
-        >
-          {{ statusText }}
+        <div class="absolute left-3 top-3 z-10 max-w-[80%] rounded bg-black/70 px-3 py-2 text-xs text-white">
+          <div>{{ statusText }}</div><div class="mt-1 text-white/70">{{ terrainNote }}</div>
         </div>
       </template>
-
       <template #bottom-panel>
-        <div class="border-t border-gray-200 bg-gray-50 p-4">
-          <div class="mb-2 flex items-center justify-between">
-            <div class="text-sm font-semibold text-gray-700">拾取记录</div>
-            <div class="text-xs text-gray-500">
-              共 <b class="text-blue-600">{{ pickRecords.length }}</b> 条
+        <div class="max-h-[42vh] shrink-0 overflow-auto border-t bg-gray-50 p-3 text-xs">
+          <b>拾取记录 · {{ pickRecords.length }} 条</b>
+          <div v-for="record in pickRecords" :key="record.id" class="mt-2 space-y-1 rounded border bg-white p-2">
+            <div class="flex flex-wrap items-center gap-2">
+              <b>#{{ record.id }} · {{ sourceNames[record.source] }}</b>
+              <n-button size="tiny" @click="copyRecord(record)">复制</n-button>
+              <n-button size="tiny" @click="flyToRecord(record)">定位</n-button>
+              <n-button size="tiny" type="error" quaternary @click="removeRecord(record)">删除</n-button>
             </div>
+            <div>{{ record.longitude.toFixed(6) }}°，{{ record.latitude.toFixed(6) }}°；椭球高 {{ record.height.toFixed(2) }}m</div>
+            <div>画布像素 ({{ record.screenX.toFixed(0) }}, {{ record.screenY.toFixed(0) }})</div>
+            <div class="break-all text-gray-500">ECEF(m)：{{ record.cartesian.x.toFixed(2) }}, {{ record.cartesian.y.toFixed(2) }}, {{ record.cartesian.z.toFixed(2) }}</div>
           </div>
-          <div
-            v-if="pickRecords.length === 0"
-            class="py-4 text-center text-xs text-gray-400"
-          >
-            点击「开始拾取」后在地图上点击获取坐标
-          </div>
-          <div v-else class="max-h-48 overflow-auto">
-            <table class="w-full text-xs">
-              <thead class="sticky top-0 bg-gray-100">
-                <tr class="text-left text-gray-600">
-                  <th class="px-2 py-1">#</th>
-                  <th class="px-2 py-1">经度</th>
-                  <th class="px-2 py-1">纬度</th>
-                  <th class="px-2 py-1">高程(m)</th>
-                  <th class="px-2 py-1">屏幕坐标</th>
-                  <th class="px-2 py-1">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr
-                  v-for="r in pickRecords"
-                  :key="r.id"
-                  class="border-t border-gray-200 hover:bg-gray-100"
-                >
-                  <td class="px-2 py-1 font-medium text-red-600">{{ r.id }}</td>
-                  <td class="px-2 py-1">{{ r.longitude.toFixed(6) }}°</td>
-                  <td class="px-2 py-1">{{ r.latitude.toFixed(6) }}°</td>
-                  <td class="px-2 py-1">{{ r.height.toFixed(2) }}</td>
-                  <td class="px-2 py-1 text-gray-500">
-                    ({{ r.screenX.toFixed(0) }}, {{ r.screenY.toFixed(0) }})
-                  </td>
-                  <td class="px-2 py-1">
-                    <n-button size="tiny" quaternary @click="copyRecord(r)"
-                      >复制</n-button
-                    >
-                    <n-button
-                      size="tiny"
-                      type="primary"
-                      quaternary
-                      @click="flyToRecord(r)"
-                      >定位</n-button
-                    >
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
+          <div v-if="!pickRecords.length" class="py-2">暂无记录，开始拾取后点击地图。</div>
         </div>
       </template>
     </SplitViewer>
+    <n-modal v-model:show="showCopy" preset="dialog" title="手动复制坐标" :show-icon="false" positive-text="关闭">
+      <n-input :value="copyText" readonly type="textarea" />
+    </n-modal>
   </div>
 </template>

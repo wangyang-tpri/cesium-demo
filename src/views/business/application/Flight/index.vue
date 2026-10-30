@@ -62,6 +62,7 @@ WAYPOINTS.forEach((w, i) => {
 /* ============ 状态变量 ============ */
 
 const running = ref(false);
+const started = ref(false);
 let pathLine: Cesium.Entity | null = null;
 let aircraft: Cesium.Entity | null = null;
 const speedLevel = ref(1);
@@ -99,6 +100,13 @@ function getPathPose(time: Cesium.JulianDate) {
     1,
     new Cesium.JulianDate()
   );
+  if (Cesium.JulianDate.greaterThan(nextTime, stopTime)) {
+    Cesium.JulianDate.addSeconds(
+      startTime,
+      Cesium.JulianDate.secondsDifference(nextTime, stopTime),
+      nextTime
+    );
+  }
   const next = positionProperty.getValue(nextTime, new Cesium.Cartesian3());
   if (!next) return null;
   const enu = localToEnu(pos, next);
@@ -111,16 +119,27 @@ function getPathPose(time: Cesium.JulianDate) {
 function flyToPath(v: Cesium.Viewer, time: Cesium.JulianDate, duration = 1.5) {
   const pose = getPathPose(time);
   if (!pose) return;
+  // 先取消旧动画，避免旧 cancel 回调覆盖新动画状态。
+  v.camera.cancelFlight();
+  v.clock.shouldAnimate = false;
+  running.value = true;
   cameraFlying = true;
+  setCameraInputEnabled(v, false);
   v.camera.flyTo({
     destination: pose.pos,
     orientation: { heading: pose.heading, pitch: pose.pitch, roll: 0 },
     duration,
     complete: () => {
       cameraFlying = false;
+      v.clock.shouldAnimate = running.value;
+      statusText.value = `正在漫游 · ${speedLevel.value}x（暂停后可自由浏览）`;
     },
     cancel: () => {
       cameraFlying = false;
+      running.value = false;
+      v.clock.shouldAnimate = false;
+      setCameraInputEnabled(v, true);
+      statusText.value = "漫游已暂停";
     },
   });
 }
@@ -129,6 +148,8 @@ function flyToPath(v: Cesium.Viewer, time: Cesium.JulianDate, duration = 1.5) {
 
 const { viewer } = useCesiumViewer(containerRef, {
   baseLayer: "tianditu-img",
+  // 漫游采用三维相机；避免首页和场景切换控件抢占相机。
+  ui: { homeButton: false, sceneModePicker: false, selectionIndicator: false },
   camera: { position: INITIAL_CAMERA.position, pitch: INITIAL_CAMERA.pitch },
   clock: {
     start: startTime,
@@ -140,12 +161,6 @@ const { viewer } = useCesiumViewer(containerRef, {
   },
   onTick: (v, time) => {
     if (!running.value) return;
-
-    // 飞行器图标始终跟随移动
-    const pos = positionProperty.getValue(time, new Cesium.Cartesian3());
-    if (pos && aircraft && aircraft.position) {
-      (aircraft.position as Cesium.ConstantPositionProperty).setValue(pos);
-    }
 
     // 相机正在 flyTo 时，不强制 setView
     if (cameraFlying) return;
@@ -179,7 +194,7 @@ function ensureVisuals() {
   }
   if (!aircraft) {
     aircraft = v.entities.add({
-      position: points[0],
+      position: positionProperty,
       billboard: {
         image: Cesium.buildModuleUrl("Assets/Textures/maki/airport.png"),
         scale: 1.2,
@@ -194,34 +209,33 @@ function applyStart() {
   ensureVisuals();
   const v = viewer.value;
   if (!v) return;
-  running.value = true;
-  v.clock.currentTime = startTime;
-  v.clock.shouldAnimate = true;
+  started.value = true;
+  v.clock.currentTime = Cesium.JulianDate.clone(startTime);
   // 漫游开始：禁用用户鼠标和键盘操作，避免干扰相机跟随
   setCameraInputEnabled(v, false);
-  statusText.value =
-    "▶ 漫游开始：相机飞往路径起点，然后沿路径飞行（用户操作已禁用）";
   // 相机从当前位置 flyTo 到路径起点（明显的飞行动画，2秒）
   flyToPath(v, startTime, 2);
+  statusText.value = "正在进入路线，抵达起点后开始漫游…";
 }
 
 function applyPause() {
   activeFeature.value = "start";
   const v = viewer.value;
-  if (!v) return;
-  running.value = !running.value;
-  if (!running.value) {
+  if (!v || !started.value) return;
+  if (running.value) {
+    running.value = false;
     v.clock.shouldAnimate = false;
+    v.camera.cancelFlight();
+    cameraFlying = false;
     // 暂停：恢复用户鼠标和键盘操作
     setCameraInputEnabled(v, true);
     statusText.value = "⏸ 漫游暂停（用户操作已恢复）";
   } else {
-    v.clock.shouldAnimate = true;
     // 继续：禁用用户鼠标和键盘操作
     setCameraInputEnabled(v, false);
-    statusText.value = "继续漫游（用户操作已禁用）";
     // 继续时 flyTo 回路径当前位置
     flyToPath(v, v.clock.currentTime);
+    statusText.value = "正在返回路线，抵达后继续漫游…";
   }
 }
 
@@ -231,14 +245,7 @@ function applySpeed() {
   if (!v) return;
   speedLevel.value = speedLevel.value >= 4 ? 1 : speedLevel.value + 1;
   v.clock.multiplier = speedLevel.value * 4;
-  if (!running.value) {
-    running.value = true;
-    v.clock.shouldAnimate = true;
-    // 速度切换触发漫游：禁用用户操作
-    setCameraInputEnabled(v, false);
-    flyToPath(v, v.clock.currentTime);
-  }
-  statusText.value = `速度 ${speedLevel.value}x（clock.multiplier = ${v.clock.multiplier}，用户操作已禁用）`;
+  statusText.value = `速度 ${speedLevel.value}x · ${running.value ? (cameraFlying ? "正在进入路线" : "正在漫游") : (started.value ? "已暂停" : "待开始")}`;
 }
 
 function applyReset() {
@@ -246,8 +253,12 @@ function applyReset() {
   running.value = false;
   const v = viewer.value;
   if (!v) return;
+  v.camera.cancelFlight();
+  started.value = false;
+  speedLevel.value = 1;
+  v.clock.multiplier = 4;
   v.clock.shouldAnimate = false;
-  v.clock.currentTime = startTime;
+  v.clock.currentTime = Cesium.JulianDate.clone(startTime);
   // 重置：恢复用户鼠标和键盘操作
   setCameraInputEnabled(v, true);
   cameraFlying = true;
@@ -266,7 +277,7 @@ function applyReset() {
       cameraFlying = false;
     },
   });
-  statusText.value = "已重置（用户操作已恢复）";
+  statusText.value = "已重置视角、路线进度和速度，可重新开始漫游";
 }
 
 // viewer 就绪后添加路径线和飞行器
@@ -289,17 +300,23 @@ waypoints.forEach((w, i) => {
 })
 
 // ② 每帧：当前时间位置 + 朝向 + 相机跟随
-viewer.clock.onTick.addEventListener((time) => {
+viewer.clock.onTick.addEventListener((clock) => {
+  const time = clock.currentTime
   const pos = positionProperty.getValue(time, new Cesium.Cartesian3())
-  const next = positionProperty.getValue(time + 1s, ...)
+  const nextTime = Cesium.JulianDate.addSeconds(time, 1, new Cesium.JulianDate())
+  if (Cesium.JulianDate.greaterThan(nextTime, stopTime)) {
+    Cesium.JulianDate.addSeconds(startTime,
+      Cesium.JulianDate.secondsDifference(nextTime, stopTime), nextTime)
+  }
+  const next = positionProperty.getValue(nextTime, new Cesium.Cartesian3())
 
   // 计算朝向：把前进方向投影到本地 ENU
-  const enu = toLocalEnu(pos, next)
+  const enu = localToEnu(pos, next)
   const heading = Math.atan2(enu.x, enu.y)
 
   viewer.camera.setView({
     destination: pos,
-    orientation: { heading, pitch: -8°, roll: 0 },
+    orientation: { heading, pitch: Cesium.Math.toRadians(-8), roll: 0 },
   })
 })`,
 };
@@ -307,13 +324,15 @@ viewer.clock.onTick.addEventListener((time) => {
 const explainMap: Record<string, () => string> = {
   start: () => `【原理】飞行漫游 = 时间驱动位置属性 + 每帧相机跟随：
 1. SampledPositionProperty：对途经点按时间采样，内部 Hermite 插值
-   （Cesium 推荐做法，比 CatmullRomSpline 更稳定）
+   （循环终点的前瞻采样回绕到起点）
 2. clock 时间推进（可倍速/暂停/循环），positionProperty.getValue(time) 取位置
 3. 朝向 = 当前位置指向下一点的方向在"东-北-上"局部系的投影
    （Math.atan2(east, north) 即相对正北的 heading）
 4. camera.setView 每帧写入相机状态
 
-【交互】用户鼠标按下/滚轮时暂停相机跟随，松开后 flyTo 平滑回路径。
+【交互】漫游时禁用鼠标相机操作；点击暂停后可自由浏览，继续时平滑返回路线。
+进入路线期间冻结时钟，抵达后开始计时；调速不会自动解除暂停。
+重置同时恢复初始视角、路线起点及 1x 速度。
 【要点】配合 clock.multiplier 实现变速；可扩展为第一人称/第三人称视角。`,
 };
 
@@ -331,21 +350,24 @@ const { code, explanation } = useCodeExplain(
         size="small"
         :type="activeFeature === 'start' ? 'primary' : 'default'"
         @click="applyStart"
+        :disabled="!viewer"
         >开始漫游</n-button
       >
       <n-button
         size="small"
         :type="activeFeature === 'start' ? 'primary' : 'default'"
         @click="applyPause"
+        :disabled="!viewer || !started"
         >{{ running ? "暂停" : "继续" }}</n-button
       >
       <n-button
         size="small"
         :type="activeFeature === 'start' ? 'primary' : 'default'"
         @click="applySpeed"
+        :disabled="!viewer"
         >速度 {{ speedLevel }}x</n-button
       >
-      <n-button size="small" quaternary @click="applyReset">重置视角</n-button>
+      <n-button size="small" quaternary :disabled="!viewer" @click="applyReset">重置漫游</n-button>
     </div>
 
     <SplitViewer

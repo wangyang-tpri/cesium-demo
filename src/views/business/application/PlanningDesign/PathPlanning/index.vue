@@ -1,371 +1,129 @@
 <script setup lang="ts">
-import { ref, provide, onBeforeUnmount } from 'vue';
 import * as Cesium from 'cesium';
+import { computed, provide, ref, shallowRef } from 'vue';
 import SplitViewer from '@/components/base/SplitViewer.vue';
-import { useCesiumViewer } from '@/hooks/useCesiumViewer';
+import { useSpatialAnalysis } from '@/hooks/useSpatialAnalysis';
 import { useCodeExplain } from '@/hooks/useCodeExplain';
+import { routeDistance } from '@/utils/planningGeometry';
 
 const containerRef = ref<HTMLDivElement | null>(null);
 provide('splitViewerContainerRef', containerRef);
-
-const { viewer } = useCesiumViewer(containerRef, {
-  baseLayer: 'tianditu-img',
-  camera: { position: [108.94, 34.2, 30000], pitch: -55 },
-});
-
-const activeFeature = ref<'add-point' | 'calculate' | 'undo' | 'clear'>('add-point');
-const statusText = ref('路径规划：点击「添加航点」，然后在地图上依次点击添加航点，点击「计算路径」生成规划路径。');
-
-// 航点列表
-interface Waypoint {
-  id: number;
-  position: Cesium.Cartesian3;
-  longitude: number;
-  latitude: number;
-  height: number;
+const activeFeature = ref('analyze');
+const analysis = useSpatialAnalysis(containerRef, '添加至少两个航点，再计算按顺序连接的规划路线。', false);
+const { viewer, ready, picking, statusText, terrainNote } = analysis;
+terrainNote.value = '航点顺序连线；距离按 WGS84 椭球测地线计算，不是道路导航或 A* 寻路';
+interface Waypoint { id: number; position: Cesium.Cartesian3; longitude: number; latitude: number }
+const waypoints = shallowRef<Waypoint[]>([]);
+let counter = 0;
+const markers: Cesium.Entity[] = [];
+let path: Cesium.Entity | undefined;
+const stats = ref<{ distance: number; segments: number } | null>(null);
+const walkSpeed = ref<number | null>(5);
+const carSpeed = ref<number | null>(40);
+function formatTime(distance: number, speed: number | null) {
+  if (speed === null || !Number.isFinite(speed) || speed <= 0 || speed > 300) return '速度无效';
+  const minutes = distance / 1000 / speed * 60;
+  if (minutes < 1) return '小于1分钟';
+  const rounded = Math.ceil(minutes);
+  return rounded >= 60 ? Math.floor(rounded / 60) + '小时' + rounded % 60 + '分钟' : rounded + '分钟';
 }
-
-const waypoints = ref<Waypoint[]>([]);
-let waypointIdCounter = 0;
-let picking = false;
-let handler: Cesium.ScreenSpaceEventHandler | null = null;
-let pathEntity: Cesium.Entity | null = null;
-let waypointEntities: Cesium.Entity[] = [];
-
-// 路径统计
-const pathStats = ref({
-  totalDistance: 0,
-  segmentCount: 0,
-  estimatedTimeWalk: 0,
-  estimatedTimeCar: 0,
-});
-
-onBeforeUnmount(() => {
-  if (handler) {
-    handler.destroy();
-    handler = null;
-  }
-});
-
-function startPicking() {
-  clearPath();
-  picking = true;
-  statusText.value = "请在地图上依次点击添加航点（至少2个），点击「计算路径」完成规划。";
-  if (!handler) {
-    const v = viewer.value!;
-    handler = new Cesium.ScreenSpaceEventHandler(v.scene.canvas);
-    handler.setInputAction((click: any) => {
-      if (!picking) return;
-      const v = viewer.value!;
-      const cartesian = v.scene.pickPosition(click.position);
-      if (!cartesian) return;
-      const carto = Cesium.Cartographic.fromCartesian(cartesian);
-      const wp: Waypoint = {
-        id: ++waypointIdCounter,
-        position: cartesian,
-        longitude: Cesium.Math.toDegrees(carto.longitude),
-        latitude: Cesium.Math.toDegrees(carto.latitude),
-        height: carto.height,
-      };
-      waypoints.value.push(wp);
-      addWaypointEntity(wp);
-      statusText.value = `已添加 ${waypoints.value.length} 个航点，继续点击添加或点击「计算路径」。`;
-    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
-  }
-}
-
-function addWaypointEntity(wp: Waypoint) {
-  const v = viewer.value!;
-  const entity = v.entities.add({
-    position: wp.position,
-    point: {
-      pixelSize: 12,
-      color: Cesium.Color.fromCssColorString('#18a058'),
-      outlineColor: Cesium.Color.WHITE,
-      outlineWidth: 2,
-    },
-    label: {
-      text: `航点${wp.id}`,
-      font: '13px sans-serif',
-      pixelOffset: new Cesium.Cartesian2(0, -22),
-      fillColor: Cesium.Color.WHITE,
-      outlineColor: Cesium.Color.BLACK,
-      outlineWidth: 3,
-      style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-    },
-  });
-  waypointEntities.push(entity);
-}
-
-function calculatePath() {
-  if (waypoints.value.length < 2) {
-    statusText.value = "至少需要2个航点才能计算路径，请继续添加航点。";
-    return;
-  }
-  picking = false;
-  const v = viewer.value!;
-
-  // 清除旧路径
-  if (pathEntity) {
-    v.entities.remove(pathEntity);
-    pathEntity = null;
-  }
-
-  // 构建路径坐标
-  const positions = waypoints.value.map(wp => wp.position);
-
-  // 添加路径线
-  pathEntity = v.entities.add({
-    polyline: {
-      positions: positions,
-      width: 5,
-      material: new Cesium.PolylineGlowMaterialProperty({
-        glowPower: 0.2,
-        color: Cesium.Color.fromCssColorString('#18a058'),
-      }),
-      clampToGround: true,
-    },
-  });
-
-  // 计算每段距离和总距离
-  let totalDistance = 0;
-  for (let i = 0; i < positions.length - 1; i++) {
-    const dist = Cesium.Cartesian3.distance(positions[i], positions[i + 1]);
-    totalDistance += dist;
-  }
-
-  // 预计时间（步行 5km/h，汽车 40km/h）
-  const walkSpeed = 5000 / 3600; // m/s
-  const carSpeed = 40000 / 3600; // m/s
-  pathStats.value = {
-    totalDistance: totalDistance,
-    segmentCount: positions.length - 1,
-    estimatedTimeWalk: totalDistance / walkSpeed,
-    estimatedTimeCar: totalDistance / carSpeed,
-  };
-
-  statusText.value = `路径规划完成：共 ${pathStats.value.segmentCount} 段，总距离 ${(totalDistance / 1000).toFixed(2)} km，步行约 ${formatTime(pathStats.value.estimatedTimeWalk)}，驾车约 ${formatTime(pathStats.value.estimatedTimeCar)}。`;
-
-  // 飞到路径
-  v.camera.flyTo({
-    destination: Cesium.Cartesian3.fromDegrees(
-      waypoints.value[0].longitude,
-      waypoints.value[0].latitude,
-      Math.max(totalDistance * 0.8, 2000)
-    ),
-    duration: 1.5,
-  });
-}
-
-function formatTime(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  if (h > 0) return `${h}小时${m}分钟`;
-  return `${m}分钟`;
-}
-
-function removeLastWaypoint() {
-  if (waypoints.value.length === 0) return;
-  waypoints.value.pop();
-  const lastEntity = waypointEntities.pop();
-  if (lastEntity) {
-    viewer.value!.entities.remove(lastEntity);
-  }
-  statusText.value = `已删除最后一个航点，当前共 ${waypoints.value.length} 个航点。`;
-}
-
-function clearPath() {
-  const v = viewer.value!;
-  if (pathEntity) {
-    v.entities.remove(pathEntity);
-    pathEntity = null;
-  }
-  waypointEntities.forEach(e => v.entities.remove(e));
-  waypointEntities = [];
-  waypoints.value = [];
-  waypointIdCounter = 0;
-  pathStats.value = { totalDistance: 0, segmentCount: 0, estimatedTimeWalk: 0, estimatedTimeCar: 0 };
-}
-
+const walkTime = computed(() => stats.value ? formatTime(stats.value.distance, walkSpeed.value) : '—');
+const carTime = computed(() => stats.value ? formatTime(stats.value.distance, carSpeed.value) : '—');
+function invalidate() { analysis.remove(path); path = undefined; stats.value = null; }
 function applyStart() {
-  activeFeature.value = 'add-point';
-  startPicking();
-}
-
-function applyCalculate() {
-  activeFeature.value = 'calculate';
-  calculatePath();
-}
-
-function applyUndo() {
-  activeFeature.value = 'undo';
-  removeLastWaypoint();
-}
-
-function applyClear() {
-  activeFeature.value = 'clear';
-  picking = false;
-  clearPath();
-  statusText.value = "已清除，点击「添加航点」重新规划路径。";
-}
-
-const codeMap: Record<'add-point' | 'calculate' | 'undo' | 'clear', () => string> = {
-  'add-point': () => `// 1. 点击添加航点
-handler.setInputAction((click) => {
-  const cartesian = viewer.scene.pickPosition(click.position);
-  const carto = Cartographic.fromCartesian(cartesian);
-  waypoints.push({
-    id: ++idCounter,
-    position: cartesian,
-    longitude: toDegrees(carto.longitude),
-    latitude: toDegrees(carto.latitude),
+  if (!ready.value) return;
+  analysis.pick(position => {
+    const last = waypoints.value.at(-1);
+    if (last && Cesium.Cartesian3.distance(last.position, position) < 1) {
+      statusText.value = '相邻航点需至少相距 1 米'; return;
+    }
+    if (waypoints.value.length >= 100) { statusText.value = '最多支持 100 个航点'; return; }
+    invalidate();
+    const carto = Cesium.Cartographic.fromCartesian(position);
+    waypoints.value = [...waypoints.value, { id: ++counter, position,
+      longitude: Cesium.Math.toDegrees(carto.longitude), latitude: Cesium.Math.toDegrees(carto.latitude) }];
+    markers.push(analysis.add({ position,
+      point: { pixelSize: 10, color: Cesium.Color.LIME, heightReference: Cesium.HeightReference.CLAMP_TO_GROUND },
+      label: { text: '航点' + waypoints.value.length, font: '12px sans-serif',
+        pixelOffset: new Cesium.Cartesian2(0, -22), heightReference: Cesium.HeightReference.CLAMP_TO_GROUND },
+    }));
+    statusText.value = '已添加 ' + waypoints.value.length + ' 个航点，继续添加或计算路径';
   });
-}, ScreenSpaceEventType.LEFT_CLICK);
-
-// 2. 添加航点实体
-viewer.entities.add({
-  position: wp.position,
-  point: { pixelSize: 12, color: Color.GREEN },
-  label: { text: \`航点\${wp.id}\` },
-});`,
-  'calculate': () => `// 3. 构建路径线
-const positions = waypoints.map(wp => wp.position);
-viewer.entities.add({
-  polyline: {
-    positions: positions,
-    width: 5,
-    material: new PolylineGlowMaterialProperty({
-      glowPower: 0.2,
-      color: Color.GREEN,
-    }),
-    clampToGround: true,
-  },
-});
-
-// 4. 计算总距离
-let totalDistance = 0;
-for (let i = 0; i < positions.length - 1; i++) {
-  totalDistance += Cartesian3.distance(
-    positions[i], positions[i + 1]
-  );
+  statusText.value = '正在添加航点；已有航点保留，按点击顺序连接';
 }
-
-// 5. 预计时间（步行5km/h，驾车40km/h）
-const walkTime = totalDistance / (5000/3600);
-const carTime = totalDistance / (40000/3600);`,
-  'undo': () => `// 撤销最后一个航点
-waypoints.pop();
-const lastEntity = waypointEntities.pop();
-if (lastEntity) {
-  viewer.entities.remove(lastEntity);
-}`,
-  'clear': () => `// 清除所有航点和路径
-waypointEntities.forEach(e => viewer.entities.remove(e));
-waypointEntities = [];
-waypoints = [];
-if (pathEntity) {
-  viewer.entities.remove(pathEntity);
-  pathEntity = null;
-}`,
-};
-
-const explainMap: Record<'add-point' | 'calculate' | 'undo' | 'clear', () => string> = {
-  'add-point': () => `【原理】航点采集 = 屏幕坐标转三维坐标 + 实体标记：
-1. 使用 ScreenSpaceEventHandler 监听地图左键点击事件
-2. scene.pickPosition 从屏幕坐标获取三维空间坐标（含地形高度）
-3. Cartographic.fromCartesian 转换为地理坐标（经纬度弧度）
-4. toDegrees 转换为经纬度度数，记录航点信息
-5. 添加 point + label 实体，在地图上标记航点位置
-
-【API】
-• ScreenSpaceEventHandler: 屏幕空间事件处理器
-• scene.pickPosition: 屏幕坐标转三维坐标
-• Cartographic.fromCartesian: 笛卡尔坐标转地理坐标
-• Entity.point / Entity.label: 点和标签实体`,
-  'calculate': () => `【原理】路径计算 = 折线连接 + 距离累加 + 时间换算：
-1. 按航点顺序用 Polyline 连接形成规划路径
-2. PolylineGlowMaterialProperty 发光线材质增强视觉效果
-3. clampToGround 贴地模式，路径沿地形表面绘制
-4. Cartesian3.distance 计算每段两点间的欧几里得距离（米）
-5. 累加所有段距离得到总路径长度
-6. 根据不同交通方式的平均速度，换算预计通行时间
-
-【API】
-• Entity.polyline: 折线实体，positions 定义路径点序列
-• PolylineGlowMaterialProperty: 发光线材质
-• Cartesian3.distance: 两点间距离计算
-• clampToGround: 折线贴地模式`,
-  'undo': () => `【原理】撤销航点 = 数组弹出 + 实体移除：
-1. waypoints.pop() 移除最后一个航点数据
-2. waypointEntities.pop() 获取最后一个航点实体
-3. viewer.entities.remove() 从场景中移除该实体
-
-【要点】撤销操作只影响最后一个航点，已计算的路径需要重新计算。`,
-  'clear': () => `【原理】清除 = 批量移除实体 + 重置数据：
-1. 遍历 waypointEntities，逐个移除航点实体
-2. 移除路径实体 pathEntity
-3. 重置 waypoints、waypointEntities、pathStats 等数据
-
-【要点】清除操作会移除所有航点和路径，不可撤销。`,
-};
-
-const { code, explanation } = useCodeExplain(codeMap, explainMap, activeFeature);
+function applyCalculate() {
+  if (!ready.value || waypoints.value.length < 2) return;
+  try {
+    const positions = waypoints.value.map(p => p.position);
+    const distance = routeDistance(positions);
+    invalidate();
+    picking.value = false;
+    path = analysis.add({ polyline: { positions, width: 4, clampToGround: true, material: Cesium.Color.LIME } });
+    stats.value = { distance, segments: positions.length - 1 };
+    statusText.value = '规划连线完成：' + stats.value.segments + ' 段，共 ' + (distance / 1000).toFixed(3) + 'km；参考时间按下方速度计算';
+  } catch (error) {
+    statusText.value = '路径计算失败：' + (error instanceof Error ? error.message : '请调整航点');
+  }
+}
+function applyUndo() {
+  if (!waypoints.value.length) return;
+  invalidate(); analysis.remove(markers.pop());
+  waypoints.value = waypoints.value.slice(0, -1);
+  statusText.value = '已撤销航点，旧路径和统计已清除，请重新计算';
+}
+function stopPicking() { picking.value = false; statusText.value = '已停止添加航点'; }
+function locate() {
+  if (!viewer.value || !waypoints.value.length) return;
+  const sphere = Cesium.BoundingSphere.fromPoints(waypoints.value.map(p => p.position));
+  viewer.value.camera.flyToBoundingSphere(sphere, { offset: new Cesium.HeadingPitchRange(0, -Math.PI / 3, Math.max(sphere.radius * 3, 2000)) });
+}
+function applyClear() {
+  analysis.clear(); waypoints.value = []; markers.length = 0; counter = 0; path = undefined; stats.value = null;
+  statusText.value = '已清除航点与路径';
+}
+const { code, explanation } = useCodeExplain({ analyze: () => `// 航点按输入顺序连接，逐段使用 WGS84 测地线长度
+const total = positions.slice(1).reduce((sum, p, i) => sum +
+  new EllipsoidGeodesic(Cartographic.fromCartesian(positions[i]),
+    Cartographic.fromCartesian(p)).surfaceDistance, 0)
+// 参考时间（公里 / 公里每小时）
+const minutes = total / 1000 / speed * 60
+// 新增、撤销航点时立即移除旧路径并清空统计` }, {
+  analyze: () => `【功能】按航点顺序生成贴地规划连线，支持继续添加、停止添加、撤销、定位和清除。
+【距离】使用椭球测地线距离，避免把穿过地球内部的弦长作为地表距离；不计坡面起伏。
+【时间】按用户输入速度估算，不考虑道路、交通规则、拥堵和障碍。
+【范围】这里是航点连线规划，没有道路网络和障碍数据，不提供 A* 避障或道路最短路径。`,
+}, activeFeature);
 </script>
 
 <template>
   <div class="flex h-full flex-col gap-3 p-4">
     <div class="flex flex-wrap items-center gap-2">
-      <n-button size="small" type="success" @click="applyStart">添加航点</n-button>
-      <n-button size="small" type="primary" @click="applyCalculate">计算路径</n-button>
-      <n-button size="small" type="warning" @click="applyUndo">撤销航点</n-button>
+      <n-button size="small" type="success" :disabled="!ready" @click="applyStart">{{ picking ? '继续添加中' : '添加航点' }}</n-button>
+      <n-button size="small" :disabled="!picking" @click="stopPicking">停止添加</n-button>
+      <n-button size="small" type="primary" :disabled="!ready || waypoints.length < 2" @click="applyCalculate">计算路径</n-button>
+      <n-button size="small" :disabled="!waypoints.length" @click="applyUndo">撤销航点</n-button>
+      <n-button size="small" :disabled="!waypoints.length" @click="locate">定位路线</n-button>
       <n-button size="small" quaternary @click="applyClear">清除</n-button>
     </div>
-
-    <SplitViewer
-      :title="activeFeature"
-      :code="code"
-      :explanation="explanation"
-      :default-split-size="70"
-      storage-key="path-planning-split"
-    >
+    <SplitViewer title="路径规划" :code="code" :explanation="explanation" storage-key="path-planning-split">
       <template #scene-overlay>
-        <div class="absolute left-3 top-3 z-10 max-w-[70%] rounded bg-black/60 px-3 py-1.5 text-xs text-white">
-          {{ statusText }}
+        <div class="absolute left-3 top-3 z-10 max-w-[80%] rounded bg-black/70 px-3 py-2 text-xs text-white">
+          <div>{{ statusText }}</div><div class="mt-1 text-white/70">{{ terrainNote }}</div>
         </div>
       </template>
-
-    <template #bottom-panel>
-      <div v-if="pathStats.totalDistance > 0" class="border-t border-gray-200 bg-gray-50 p-4">
-        <div class="mb-2 text-sm font-semibold text-gray-700">路径统计</div>
-        <div class="grid grid-cols-4 gap-4 text-center">
-          <div>
-            <div class="text-lg font-bold text-green-600">{{ (pathStats.totalDistance / 1000).toFixed(2) }}</div>
-            <div class="text-xs text-gray-500">总距离 (km)</div>
+      <template #bottom-panel>
+        <div class="shrink-0 border-t bg-gray-50 p-3 text-xs">
+          <div class="mb-2 flex flex-wrap items-center gap-2">
+            <span>步行(km/h)</span><n-input-number v-model:value="walkSpeed" :min="0.1" :max="300" size="small" style="width: 85px" />
+            <span>驾车(km/h)</span><n-input-number v-model:value="carSpeed" :min="0.1" :max="300" size="small" style="width: 85px" />
           </div>
-          <div>
-            <div class="text-lg font-bold text-blue-600">{{ pathStats.segmentCount }}</div>
-            <div class="text-xs text-gray-500">路径段数</div>
-          </div>
-          <div>
-            <div class="text-lg font-bold text-orange-600">{{ formatTime(pathStats.estimatedTimeWalk) }}</div>
-            <div class="text-xs text-gray-500">步行预计 (5km/h)</div>
-          </div>
-          <div>
-            <div class="text-lg font-bold text-red-600">{{ formatTime(pathStats.estimatedTimeCar) }}</div>
-            <div class="text-xs text-gray-500">驾车预计 (40km/h)</div>
+          <div v-if="stats">总距离 {{ (stats.distance / 1000).toFixed(3) }}km · {{ stats.segments }} 段<br />步行参考 {{ walkTime }} · 驾车参考 {{ carTime }}</div>
+          <div v-else>添加或撤销航点后请重新计算路径。</div>
+          <div class="mt-2 max-h-28 overflow-auto">
+            <div v-for="(wp, index) in waypoints" :key="wp.id" class="py-1">航点{{ index + 1 }}：{{ wp.longitude.toFixed(6) }}°，{{ wp.latitude.toFixed(6) }}°</div>
           </div>
         </div>
-        <div class="mt-3 max-h-32 overflow-auto">
-          <div class="text-xs text-gray-500">航点列表：</div>
-          <div v-for="(wp, idx) in waypoints" :key="wp.id" class="mt-1 flex items-center gap-2 text-xs text-gray-600">
-            <span class="inline-flex h-5 w-5 items-center justify-center rounded-full bg-green-500 text-white">{{ idx + 1 }}</span>
-            <span>经度: {{ wp.longitude.toFixed(6) }}°</span>
-            <span>纬度: {{ wp.latitude.toFixed(6) }}°</span>
-            <span>高程: {{ wp.height.toFixed(1) }}m</span>
-          </div>
-        </div>
-      </div>
-    </template>
+      </template>
     </SplitViewer>
   </div>
 </template>

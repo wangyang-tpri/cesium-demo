@@ -19,7 +19,7 @@ const features = [
   {
     key: 'path-planning',
     title: '路径规划',
-    desc: '起点终点点击选点，A* 算法计算最短路径，路径长度与预计时间可视化',
+    desc: '按航点顺序生成规划连线，计算椭球面距离和指定速度下的参考时间',
     icon: PathIcon,
     color: '#18a058',
   },
@@ -33,7 +33,7 @@ const features = [
   {
     key: 'site-selection',
     title: '选址分析',
-    desc: '多因子加权评价模型，候选点综合得分计算，适宜性等级颜色编码',
+    desc: '人工录入调查评分，按可调因子权重计算综合得分与适宜性排名',
     icon: SiteIcon,
     color: '#f0a020',
   },

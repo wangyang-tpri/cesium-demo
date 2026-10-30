@@ -1,344 +1,168 @@
 <script setup lang="ts">
-import * as Cesium from "cesium";
-import { ref, provide, watch } from "vue";
-import { useCesiumViewer } from "@/hooks/useCesiumViewer";
-import { useCodeExplain } from "@/hooks/useCodeExplain";
-import SplitViewer from "@/components/base/SplitViewer.vue";
+import * as Cesium from 'cesium';
+import { provide, ref, watch } from 'vue';
+import SplitViewer from '@/components/base/SplitViewer.vue';
+import { useCodeExplain } from '@/hooks/useCodeExplain';
+import { useSpatialAnalysis } from '@/hooks/useSpatialAnalysis';
+import { clipFloodTriangle, localPoint, polygonArea, sampleHeights, type FloodVertex } from '@/utils/spatialAnalysis';
 
 const containerRef = ref<HTMLDivElement | null>(null);
-provide("splitViewerContainerRef", containerRef);
-const activeFeature = ref("analyze");
-const statusText = ref(
-  "淹没分析：点击「设置区域」在地图上点击，然后调节水位滑块查看淹没范围。"
-);
+provide('splitViewerContainerRef', containerRef);
+const activeFeature = ref('analyze');
+const analysis = useSpatialAnalysis(containerRef, '设置区域中心，采样完成后调节水位查看淹没范围。');
+const { viewer, statusText, ready, busy, terrainNote } = analysis;
+const waterLevel = ref(400);
+const waterMin = ref(0);
+const waterMax = ref(1000);
+const areaSize = ref(3000);
+const hasArea = ref(false);
+const hasCenter = ref(false);
+const GRID = 30;
+let center: Cesium.Cartesian3 | undefined;
+let boundary: Cesium.Entity | undefined;
+let water: Cesium.Primitive | undefined;
+let footprint: Cesium.GroundPrimitive | undefined;
+let cache: { center: Cesium.Cartesian3; size: number; vertices: FloodVertex[] } | undefined;
 
-const { viewer } = useCesiumViewer(containerRef, {
-  baseLayer: "tianditu-img",
-  camera: { position: [108.94, 34.2, 15000], pitch: -55 },
-});
-
-const waterLevel = ref(400); // 水位高度（米）
-const areaSize = ref(3000); // 区域大小（米，正方形边长）
-
-let centerPos: Cesium.Cartesian3 | null = null;
-let centerEntity: Cesium.Entity | null = null;
-let areaEntity: Cesium.Entity | null = null;
-let floodEntity: Cesium.Entity | null = null;
-let waterSurfaceEntity: Cesium.Entity | null = null;
-let picking = false;
-let handler: Cesium.ScreenSpaceEventHandler | null = null;
-
-function clearAll() {
-  const v = viewer.value;
-  if (!v) return;
-  for (const e of [centerEntity, areaEntity, floodEntity, waterSurfaceEntity]) {
-    if (e) v.entities.remove(e);
-  }
-  centerEntity = areaEntity = floodEntity = waterSurfaceEntity = null;
-  centerPos = null;
+function clearWater() {
+  analysis.removePrimitive(water); water = undefined;
+  analysis.removePrimitive(footprint); footprint = undefined;
 }
-
-function pickPoint(windowPos: Cesium.Cartesian2): Cesium.Cartesian3 | null {
-  const v = viewer.value;
-  if (!v) return null;
-  const ray = v.camera.getPickRay(windowPos);
-  if (!ray) return null;
-  return v.scene.globe.pick(ray, v.scene) || null;
+function applyClear() {
+  analysis.clear(); center = undefined; boundary = undefined; water = undefined; footprint = undefined;
+  cache = undefined; hasArea.value = false; hasCenter.value = false;
+  statusText.value = '已清除，可重新设置分析区域';
 }
-
-function startPicking() {
-  clearAll();
-  picking = true;
-  statusText.value = "请在地图上点击设置淹没区域中心...";
-  if (!handler) {
-    const v = viewer.value!;
-    handler = new Cesium.ScreenSpaceEventHandler(v.scene.canvas);
-    handler.setInputAction((click: any) => {
-      if (!picking) return;
-      const pos = pickPoint(click.position);
-      if (!pos) return;
-      centerPos = pos;
-      picking = false;
-      // 中心点标记
-      centerEntity = v.entities.add({
-        position: pos,
-        point: {
-          pixelSize: 12,
-          color: Cesium.Color.CYAN,
-          outlineColor: Cesium.Color.WHITE,
-          outlineWidth: 2,
-        },
-        label: {
-          text: "区域中心",
-          font: "13px sans-serif",
-          pixelOffset: new Cesium.Cartesian2(0, -22),
-          fillColor: Cesium.Color.CYAN,
-          outlineColor: Cesium.Color.BLACK,
-          outlineWidth: 3,
-          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-        },
-      });
-      statusText.value = `区域中心已设置（范围 ${areaSize.value}m x ${areaSize.value}m），调节水位滑块查看淹没范围`;
-      updateFlood();
-    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
-  }
-}
-
-async function updateFlood() {
-  const v = viewer.value;
-  if (!v || !centerPos) return;
-
-  const centerCarto = Cesium.Cartographic.fromCartesian(centerPos);
-  const halfSize = areaSize.value / 2;
-  const GRID = 30; // 网格分辨率（30x30）
-
-  // 生成网格点
-  const cartographics: Cesium.Cartographic[] = [];
-  for (let i = 0; i <= GRID; i++) {
-    for (let j = 0; j <= GRID; j++) {
-      const dx = (j / GRID - 0.5) * halfSize * 2;
-      const dy = (i / GRID - 0.5) * halfSize * 2;
-      // 近似：经纬度偏移（米转度）
-      const lonOffset = dx / (111320 * Math.cos(centerCarto.latitude));
-      const latOffset = dy / 110540;
-      cartographics.push(
-        Cesium.Cartographic.fromRadians(
-          centerCarto.longitude + lonOffset,
-          centerCarto.latitude + latOffset,
-          0
-        )
-      );
-    }
-  }
-
-  // 采样地形高程
-  statusText.value = "正在采样地形高程...";
-  const terrainPositions = await Cesium.sampleTerrainMostDetailed(
-    v.terrainProvider,
-    cartographics
-  );
-
-  // 构建淹没区域多边形（低于水位的网格单元）
-  const wLevel = waterLevel.value;
-  const floodedCells: Cesium.Cartesian3[][] = [];
-
+function renderFlood() {
+  if (!cache || !Number.isFinite(waterLevel.value)) return;
+  clearWater();
+  const level = waterLevel.value;
+  const instances: Cesium.GeometryInstance[] = [];
+  const groundInstances: Cesium.GeometryInstance[] = [];
+  let floodedArea = 0;
   for (let i = 0; i < GRID; i++) {
     for (let j = 0; j < GRID; j++) {
-      const idx = i * (GRID + 1) + j;
-      const h = terrainPositions[idx]?.height ?? 0;
-      if (h < wLevel) {
-        // 这个网格单元被淹没，构建四边形
-        const p1 = terrainPositions[idx];
-        const p2 = terrainPositions[idx + 1];
-        const p3 = terrainPositions[idx + GRID + 2];
-        const p4 = terrainPositions[idx + GRID + 1];
-        if (p1 && p2 && p3 && p4) {
-          floodedCells.push([
-            Cesium.Cartographic.toCartesian(p1),
-            Cesium.Cartographic.toCartesian(p2),
-            Cesium.Cartographic.toCartesian(p3),
-            Cesium.Cartographic.toCartesian(p4),
-          ]);
-        }
+      const index = i * (GRID + 1) + j;
+      const corners = [cache.vertices[index], cache.vertices[index + 1],
+        cache.vertices[index + GRID + 2], cache.vertices[index + GRID + 1]];
+      for (const triangle of [[corners[0], corners[1], corners[2]], [corners[0], corners[2], corners[3]]]) {
+        const clipped = clipFloodTriangle(triangle, level);
+        const area = polygonArea(clipped);
+        if (clipped.length < 3 || area < 0.001) continue;
+        floodedArea += area;
+        const positions = clipped.map(p => {
+          const c = localPoint(cache!.center, p.x, p.y);
+          return Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, level);
+        });
+        instances.push(new Cesium.GeometryInstance({
+          geometry: Cesium.PolygonGeometry.fromPositions({ positions, height: level,
+            vertexFormat: Cesium.PerInstanceColorAppearance.FLAT_VERTEX_FORMAT }),
+          attributes: { color: Cesium.ColorGeometryInstanceAttribute.fromColor(Cesium.Color.DEEPSKYBLUE.withAlpha(0.6)) },
+        }));
+        // Keep the footprint visible when rendered terrain is coarser than samples.
+        groundInstances.push(new Cesium.GeometryInstance({
+          geometry: Cesium.PolygonGeometry.fromPositions({ positions,
+            vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT }),
+          attributes: { color: Cesium.ColorGeometryInstanceAttribute.fromColor(Cesium.Color.CYAN.withAlpha(0.5)) },
+        }));
       }
     }
   }
-
-  // 清除旧的淹没区域
-  if (floodEntity) v.entities.remove(floodEntity);
-  if (waterSurfaceEntity) v.entities.remove(waterSurfaceEntity);
-  if (areaEntity) v.entities.remove(areaEntity);
-
-  // 绘制区域边界（白色虚线框）
-  const boundaryPositions = [
-    terrainPositions[0],
-    terrainPositions[GRID],
-    terrainPositions[GRID * (GRID + 1) + GRID],
-    terrainPositions[GRID * (GRID + 1)],
-    terrainPositions[0],
-  ]
-    .filter(Boolean)
-    .map((c) => Cesium.Cartographic.toCartesian(c!));
-  areaEntity = v.entities.add({
-    polyline: {
-      positions: boundaryPositions,
-      width: 2,
-      material: Cesium.Color.WHITE.withAlpha(0.8),
-      dashPattern: 255,
-    } as any,
-  });
-
-  // 绘制淹没区域（蓝色半透明）
-  if (floodedCells.length > 0) {
-    // 将所有淹没单元合并为一个多边形（带孔）
-    const allPositions = floodedCells.flat();
-    floodEntity = v.entities.add({
-      polygon: {
-        hierarchy: new Cesium.PolygonHierarchy(allPositions),
-        material: Cesium.Color.fromCssColorString("#0fc6c2").withAlpha(0.5),
-        outline: false,
-      },
-    });
+  if (instances.length) {
+    footprint = new Cesium.GroundPrimitive({ geometryInstances: groundInstances,
+      classificationType: Cesium.ClassificationType.TERRAIN, allowPicking: false });
+    analysis.addPrimitive(footprint);
+    water = new Cesium.Primitive({ geometryInstances: instances, allowPicking: false,
+      appearance: new Cesium.PerInstanceColorAppearance({ flat: true, translucent: true, closed: false }) });
+    analysis.addPrimitive(water);
   }
-
-  // 绘制水面（区域内统一水位高度的平面）
-  const waterPositions = [
-    terrainPositions[0],
-    terrainPositions[GRID],
-    terrainPositions[GRID * (GRID + 1) + GRID],
-    terrainPositions[GRID * (GRID + 1)],
-  ]
-    .filter(Boolean)
-    .map((c) => {
-      const carto = c!;
-      return Cesium.Cartesian3.fromRadians(
-        carto.longitude,
-        carto.latitude,
-        wLevel
-      );
-    });
-  waterSurfaceEntity = v.entities.add({
-    polygon: {
-      hierarchy: new Cesium.PolygonHierarchy(waterPositions),
-      material: Cesium.Color.fromCssColorString("#409eff").withAlpha(0.3),
-      outline: true,
-      outlineColor: Cesium.Color.fromCssColorString("#409eff"),
-      outlineWidth: 1,
-    },
-  });
-
-  // 统计淹没比例
-  const totalCells = GRID * GRID;
-  const floodRatio = ((floodedCells.length / totalCells) * 100).toFixed(1);
-  statusText.value = `✅ 水位 ${wLevel}m：淹没 ${floodedCells.length}/${totalCells} 网格（${floodRatio}%），青色=淹没区域，蓝色平面=水面`;
+  statusText.value = '水位 ' + level.toFixed(1) + 'm：淹没面积约 ' + (floodedArea / 10000).toFixed(2) +
+    ' 公顷（' + (floodedArea / (cache.size * cache.size) * 100).toFixed(1) +
+    '%），网格间距 ' + (cache.size / GRID).toFixed(0) + 'm';
 }
-
-// 水位变化时实时更新
-watch(waterLevel, () => {
-  if (centerPos) updateFlood();
-});
-
+function sampleArea() {
+  if (!center || !ready.value) return;
+  const size = areaSize.value;
+  analysis.cancel(); clearWater(); analysis.remove(boundary); boundary = undefined;
+  cache = undefined; hasArea.value = false;
+  if (!Number.isFinite(size) || size < 1000 || size > 10000) {
+    statusText.value = '请输入 1000–10000 米的区域边长'; return;
+  }
+  const origin = Cesium.Cartesian3.clone(center);
+  void analysis.run(async valid => {
+    statusText.value = '正在采样区域地形，完成后可实时调节水位…';
+    const xy: { x: number; y: number }[] = [];
+    const positions: Cesium.Cartographic[] = [];
+    for (let i = 0; i <= GRID; i++) {
+      for (let j = 0; j <= GRID; j++) {
+        const x = (j / GRID - 0.5) * size;
+        const y = (i / GRID - 0.5) * size;
+        xy.push({ x, y }); positions.push(localPoint(origin, x, y));
+      }
+    }
+    const ground = await sampleHeights(viewer.value!.terrainProvider, positions);
+    if (!valid()) return;
+    cache = { center: origin, size, vertices: xy.map((p, i) => ({ ...p, height: ground[i].height })) };
+    const heights = ground.map(p => p.height);
+    const low = Math.min(...heights);
+    const high = Math.max(...heights);
+    waterMin.value = Math.floor(low - 20);
+    waterMax.value = Math.ceil(Math.max(high + 20, low + 40));
+    waterLevel.value = Math.round(low + Math.max(high - low, 10) * 0.4);
+    hasArea.value = true;
+    const edge = [ground[0], ground[GRID], ground[ground.length - 1], ground[GRID * (GRID + 1)], ground[0]];
+    boundary = analysis.add({ polyline: { positions: edge.map(p => Cesium.Cartographic.toCartesian(p)),
+      width: 2, clampToGround: true, material: new Cesium.PolylineDashMaterialProperty({ color: Cesium.Color.WHITE }) } });
+    renderFlood();
+    return undefined;
+  });
+}
 function applySetArea() {
-  activeFeature.value = "analyze";
-  startPicking();
+  if (!ready.value) return;
+  applyClear(); statusText.value = '请点击分析区域中心';
+  analysis.pick(position => {
+    center = position; hasCenter.value = true; analysis.picking.value = false;
+    analysis.add({ position, point: { pixelSize: 11, color: Cesium.Color.CYAN },
+      label: { text: '区域中心', font: '13px sans-serif', pixelOffset: new Cesium.Cartesian2(0, -22) } });
+    sampleArea();
+  });
 }
-
-function applyClear() {
-  activeFeature.value = "analyze";
-  picking = false;
-  clearAll();
-  statusText.value = "已清除，点击「设置区域」重新设置。";
-}
-
-const codeMap: Record<string, () => string> = {
-  analyze: () => `// ① 生成分析区域网格（30x30）
-const GRID = 30
-for (let i = 0; i <= GRID; i++) {
-  for (let j = 0; j <= GRID; j++) {
-    const lon = centerLon + (j/GRID - 0.5) * size
-    const lat = centerLat + (i/GRID - 0.5) * size
-    cartographics.push(Cartographic.fromRadians(lon, lat, 0))
-  }
-}
-
-// ② 高精度地形采样
-const terrain = await sampleTerrainMostDetailed(
-  terrainProvider, cartographics)
-
-// ③ 条件判断：地形高度 < 水位 → 被淹没
-for (each grid cell) {
-  if (terrainHeight < waterLevel) → 标记为淹没单元
-}
-
-// ④ 可视化：淹没区域 + 水面
-// 淹没区域：青色半透明多边形
-viewer.entities.add({ polygon: { hierarchy: floodedCells, material: Color.CYAN.withAlpha(0.5) } })
-// 水面：蓝色半透明平面（统一水位高度）
-viewer.entities.add({ polygon: { hierarchy: waterPositions, material: Color.BLUE.withAlpha(0.3) } })`,
-};
-
-const explainMap: Record<string, () => string> = {
-  analyze: () => `【原理】淹没分析 = 地形采样 + 条件着色：
-1. 在分析区域内生成 N x N 网格点
-2. sampleTerrainMostDetailed 获取每个网格点的地形高程
-3. 条件判断：地形高度 < 水位高度 → 该网格单元被淹没
-4. 可视化：
-   - 青色半透明多边形 = 被淹没的陆地区域
-   - 蓝色半透明平面 = 水面（统一水位高度）
-   - 白色虚线框 = 分析区域边界
-5. 水位滑块实时调节，重新计算淹没范围
-
-【API】
-• sampleTerrainMostDetailed：高精度地形采样（异步）
-• PolygonHierarchy：多边形层级（合并多个网格单元）
-• watch：Vue 响应式监听水位变化，实时更新
-
-【参数】
-• 水位高度：水面海拔高度（米）
-• 区域大小：分析区域边长（米，正方形）
-• 网格分辨率：30x30（越高越精确，越慢）
-
-【要点】这是基于网格的 CPU 淹没分析，适合小范围精确分析；
-大范围淹没建议用 GPU 着色器实现（深度缓冲 + 水位 uniform）。
-可扩展为：动态水位上升动画、淹没时序回放、淹没面积统计。`,
-};
-
-const { code, explanation } = useCodeExplain(
-  codeMap,
-  explainMap,
-  activeFeature
-);
+watch(waterLevel, renderFlood);
+watch(areaSize, () => { if (center) sampleArea(); });
+const { code, explanation } = useCodeExplain({ analyze: () => `// 用本地 ENU 米制坐标构建区域，转换到 WGS84 经纬度
+const position = localPoint(center, eastMeters, northMeters)
+// 区域地形仅在中心或边长改变时重新采样
+const terrain = await sampleHeights(provider, grid)
+// 每格拆成两个三角形，按水位裁切，保留部分淹没的单元
+const polygon = clipFloodTriangle(triangle, waterLevel)
+const area = polygonArea(polygon)
+// 仅在低于水位的区域显示水面，PolygonGeometry.height = waterLevel` }, {
+  analyze: () => `【原理】以区域中心的 ENU 米制坐标生成 30×30 网格，采样 31×31 个地形点。
+每格分成两个三角形，在线性高程面上按水位裁切，累计裁切后的水平投影面积。
+青色贴地着色表示淹没范围，蓝色水位面表示实际水位高度，远景时仍能辨认淹没区。
+【交互】水位范围根据区域高程自动设置。拖动水位直接使用缓存，改变边长重新采样。
+【高程】水位与地形均采用 WGS84 椭球高，不等同于当地海拔基准。
+【范围】静态水位情景：低洼孤立区域也会计入，未模拟水力连通、堤坝、流速或水量。面积受网格精度限制。`,
+}, activeFeature);
 </script>
 
 <template>
   <div class="flex h-full flex-col gap-3 p-4">
     <div class="flex flex-wrap items-center gap-2">
-      <n-button
-        size="small"
-        :type="activeFeature === 'analyze' ? 'primary' : 'default'"
-        @click="applySetArea"
-        >设置区域</n-button
-      >
+      <n-button size="small" type="primary" :disabled="!ready" @click="applySetArea">设置区域</n-button>
+      <n-button size="small" :loading="busy" :disabled="!ready || busy || !hasCenter" @click="sampleArea">重新采样</n-button>
       <n-button size="small" quaternary @click="applyClear">清除</n-button>
-      <div class="flex items-center gap-2 ml-2">
-        <span class="text-xs text-gray-500">水位(m)</span>
-        <n-slider
-          v-model:value="waterLevel"
-          :min="200"
-          :max="800"
-          :step="10"
-          :tooltip="true"
-          style="width: 200px"
-        />
-        <span class="text-sm font-mono font-bold text-blue-500"
-          >{{ waterLevel }}m</span
-        >
-      </div>
-      <div class="flex items-center gap-2">
-        <span class="text-xs text-gray-500">范围(m)</span>
-        <n-input-number
-          v-model:value="areaSize"
-          :min="1000"
-          :max="10000"
-          :step="500"
-          size="small"
-          style="width: 100px"
-        />
-      </div>
+      <span class="text-xs">水位·椭球高(m)</span>
+      <n-slider v-model:value="waterLevel" :min="waterMin" :max="waterMax" :step="1"
+        :disabled="!hasArea || busy" style="width: 180px" />
+      <span class="text-sm font-mono">{{ waterLevel }}m</span>
+      <span class="text-xs">区域边长(m)</span>
+      <n-input-number v-model:value="areaSize" :min="1000" :max="10000" :step="500" size="small" style="width: 110px" />
     </div>
-
-    <SplitViewer
-      :title="activeFeature"
-      :code="code"
-      :explanation="explanation"
-      :default-split-size="70"
-      storage-key="flood-split"
-    >
+    <SplitViewer title="淹没分析" :code="code" :explanation="explanation" storage-key="flood-split">
       <template #scene-overlay>
-        <div
-          class="absolute left-3 top-3 z-10 max-w-[70%] rounded bg-black/60 px-3 py-1.5 text-xs text-white"
-        >
-          {{ statusText }}
+        <div class="absolute left-3 top-3 z-10 max-w-[80%] rounded bg-black/70 px-3 py-2 text-xs text-white">
+          <div>{{ statusText }}</div><div class="mt-1 text-white/70">{{ terrainNote }}</div>
         </div>
       </template>
     </SplitViewer>

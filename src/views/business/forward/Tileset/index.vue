@@ -28,7 +28,6 @@ const SAMPLE_TILESET =
 
 let tileset: Cesium.Cesium3DTileset | null = null;
 let osmBuildings: Cesium.Cesium3DTileset | null = null;
-
 /** 移除场景中所有 tileset */
 function removeTilesets() {
   const v = viewer.value;

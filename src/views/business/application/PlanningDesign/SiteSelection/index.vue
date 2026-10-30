@@ -1,402 +1,161 @@
 <script setup lang="ts">
-import { ref, computed, provide, onBeforeUnmount, watch } from 'vue';
 import * as Cesium from 'cesium';
+import { computed, provide, ref, watch } from 'vue';
 import SplitViewer from '@/components/base/SplitViewer.vue';
-import { useCesiumViewer } from '@/hooks/useCesiumViewer';
+import { useSpatialAnalysis } from '@/hooks/useSpatialAnalysis';
 import { useCodeExplain } from '@/hooks/useCodeExplain';
+import { weightedScore } from '@/utils/planningGeometry';
 
 const containerRef = ref<HTMLDivElement | null>(null);
 provide('splitViewerContainerRef', containerRef);
-
-const { viewer } = useCesiumViewer(containerRef, {
-  baseLayer: 'tianditu-img',
-  camera: { position: [108.94, 34.2, 30000], pitch: -55 },
-});
-
-const activeFeature = ref<'add-site' | 'clear'>('add-site');
-const statusText = ref('选址分析：点击「添加候选点」，在地图上点击添加候选位置，系统自动计算多因子综合得分。');
-
-// 评价因子
-interface Factor {
-  key: string;
-  name: string;
-  weight: number;
-  color: string;
-}
-
-const factors = ref<Factor[]>([
-  { key: 'terrain', name: '地形适宜性', weight: 20, color: '#18a058' },
-  { key: 'traffic', name: '交通便利性', weight: 20, color: '#2080f0' },
-  { key: 'infra', name: '基础设施', weight: 20, color: '#f0a020' },
-  { key: 'environment', name: '环境质量', weight: 20, color: '#0fc6c2' },
-  { key: 'population', name: '人口密度', weight: 20, color: '#d03050' },
+const activeFeature = ref('analyze');
+const analysis = useSpatialAnalysis(containerRef, '添加候选点，并根据调查资料填写各因子评分。', false);
+const { viewer, ready, picking, statusText, terrainNote } = analysis;
+terrainNote.value = '人工多因子评价；不自动读取道路、设施、环境或人口数据，不生成随机评分';
+const factors = ref([
+  { key: 'terrain', name: '地形适宜性', weight: 20 as number | null },
+  { key: 'traffic', name: '交通便利性', weight: 20 as number | null },
+  { key: 'infra', name: '基础设施', weight: 20 as number | null },
+  { key: 'environment', name: '环境质量', weight: 20 as number | null },
+  { key: 'population', name: '人口适宜性', weight: 20 as number | null },
 ]);
-
-// 候选点
-interface CandidateSite {
-  id: number;
-  name: string;
-  position: Cesium.Cartesian3;
-  longitude: number;
-  latitude: number;
-  scores: Record<string, number>;
-  totalScore: number;
-  grade: string;
-  rank: number;
+interface Candidate {
+  id: number; name: string; position: Cesium.Cartesian3; longitude: number; latitude: number;
+  scores: Record<string, number | null>;
 }
-
-const candidates = ref<CandidateSite[]>([]);
-let siteIdCounter = 0;
-let picking = false;
-let handler: Cesium.ScreenSpaceEventHandler | null = null;
-let siteEntities: Cesium.Entity[] = [];
-
-// 权重总和
-const totalWeight = computed(() => factors.value.reduce((sum, f) => sum + f.weight, 0));
-
-// 排名后的候选点
+const candidates = ref<Candidate[]>([]);
+const selectedId = ref<number | null>(null);
+const selectedSite = computed(() => candidates.value.find(s => s.id === selectedId.value));
+const siteOptions = computed(() => candidates.value.map(s => ({ label: s.name, value: s.id })));
+const totalWeight = computed(() => factors.value.reduce((sum, f) => sum + (f.weight ?? 0), 0));
+const weightsValid = computed(() => totalWeight.value > 0 && factors.value.every(f =>
+  f.weight !== null && Number.isFinite(f.weight) && f.weight >= 0 && f.weight <= 100));
+let counter = 0;
+const markers = new Map<number, Cesium.Entity>();
+const scoreFor = (site: Candidate) => weightedScore(factors.value.map(f => site.scores[f.key]), factors.value.map(f => f.weight));
 const rankedCandidates = computed(() => {
-  return [...candidates.value].sort((a, b) => b.totalScore - a.totalScore);
+  const sorted = candidates.value.map(site => ({ ...site, totalScore: scoreFor(site), rank: null as number | null }))
+    .sort((a, b) => (b.totalScore ?? -1) - (a.totalScore ?? -1) || a.id - b.id);
+  let rank = 0;
+  sorted.forEach((site, i) => {
+    if (site.totalScore === null) return;
+    if (i === 0 || Math.abs(site.totalScore - sorted[i - 1].totalScore!) > 1e-8) rank = i + 1;
+    site.rank = rank;
+  });
+  return sorted;
 });
-
-onBeforeUnmount(() => {
-  if (handler) {
-    handler.destroy();
-    handler = null;
-  }
-});
-
-// 监听权重变化，重新计算所有候选点得分
-watch(factors, () => {
-  recalculateAllScores();
-}, { deep: true });
-
-function startPicking() {
-  picking = true;
-  statusText.value = "请在地图上点击添加候选点，系统将自动生成各因子评价得分。";
-  if (!handler) {
-    const v = viewer.value!;
-    handler = new Cesium.ScreenSpaceEventHandler(v.scene.canvas);
-    handler.setInputAction((click: any) => {
-      if (!picking) return;
-      const v = viewer.value!;
-      const cartesian = v.scene.pickPosition(click.position);
-      if (!cartesian) return;
-      addCandidateSite(cartesian);
-    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+function grade(score: number | null) {
+  if (score === null) return weightsValid.value ? '待评分' : '权重无效';
+  return score >= 80 ? '优秀' : score >= 60 ? '良好' : score >= 40 ? '一般' : '较差';
+}
+function color(score: number | null) {
+  return score === null ? '#888888' : score >= 80 ? '#18a058' : score >= 60 ? '#2080f0' : score >= 40 ? '#f0a020' : '#d03050';
+}
+function updateMarkers() {
+  for (const site of candidates.value) {
+    const entity = markers.get(site.id);
+    const score = scoreFor(site);
+    if (entity?.point) entity.point.color = new Cesium.ConstantProperty(Cesium.Color.fromCssColorString(color(score)));
+    if (entity?.label) entity.label.text = new Cesium.ConstantProperty(site.name + '\n' + (score === null ? grade(score) : score.toFixed(1) + '分'));
   }
 }
-
-function addCandidateSite(position: Cesium.Cartesian3) {
-  const carto = Cesium.Cartographic.fromCartesian(position);
-  const lon = Cesium.Math.toDegrees(carto.longitude);
-  const lat = Cesium.Math.toDegrees(carto.latitude);
-
-  // 基于经纬度生成模拟的因子得分（确定性伪随机）
-  const seed = Math.abs(Math.sin(lon * 12.9898 + lat * 78.233) * 43758.5453);
-  const scores: Record<string, number> = {};
-  factors.value.forEach((f, idx) => {
-    const s = Math.abs(Math.sin(seed * (idx + 1) * 1.7)) * 100;
-    scores[f.key] = Math.round(s * 10) / 10;
-  });
-
-  const site: CandidateSite = {
-    id: ++siteIdCounter,
-    name: `候选点${siteIdCounter}`,
-    position: position,
-    longitude: lon,
-    latitude: lat,
-    scores: scores,
-    totalScore: 0,
-    grade: '',
-    rank: 0,
-  };
-
-  site.totalScore = calculateTotalScore(scores);
-  site.grade = getGrade(site.totalScore);
-
-  candidates.value.push(site);
-  updateRanks();
-  addSiteEntity(site);
-
-  statusText.value = `「${site.name}」添加成功：综合得分 ${site.totalScore.toFixed(1)} 分，等级 ${site.grade}。当前共 ${candidates.value.length} 个候选点。`;
-}
-
-function calculateTotalScore(scores: Record<string, number>): number {
-  if (totalWeight.value === 0) return 0;
-  let weightedSum = 0;
-  factors.value.forEach(f => {
-    weightedSum += (scores[f.key] || 0) * f.weight;
-  });
-  return weightedSum / totalWeight.value;
-}
-
-function getGrade(score: number): string {
-  if (score >= 80) return '优秀';
-  if (score >= 60) return '良好';
-  if (score >= 40) return '一般';
-  return '较差';
-}
-
-function getGradeColor(score: number): string {
-  if (score >= 80) return '#18a058';
-  if (score >= 60) return '#2080f0';
-  if (score >= 40) return '#f0a020';
-  return '#d03050';
-}
-
-function updateRanks() {
-  const sorted = [...candidates.value].sort((a, b) => b.totalScore - a.totalScore);
-  sorted.forEach((site, idx) => {
-    site.rank = idx + 1;
-  });
-}
-
-function recalculateAllScores() {
-  candidates.value.forEach(site => {
-    site.totalScore = calculateTotalScore(site.scores);
-    site.grade = getGrade(site.totalScore);
-  });
-  updateRanks();
-  // 更新实体颜色
-  candidates.value.forEach(site => {
-    const entity = siteEntities.find(e => e.id === `site-${site.id}`);
-    if (entity && entity.point) {
-      entity.point.color = Cesium.Color.fromCssColorString(getGradeColor(site.totalScore));
-      if (entity.label) {
-        entity.label.text = `${site.name}\n${site.totalScore.toFixed(1)}分`;
-      }
-    }
-  });
-}
-
-function addSiteEntity(site: CandidateSite) {
-  const v = viewer.value!;
-  const color = getGradeColor(site.totalScore);
-  const entity = v.entities.add({
-    id: `site-${site.id}`,
-    position: site.position,
-    point: {
-      pixelSize: 16,
-      color: Cesium.Color.fromCssColorString(color),
-      outlineColor: Cesium.Color.WHITE,
-      outlineWidth: 3,
-    },
-    label: {
-      text: `${site.name}\n${site.totalScore.toFixed(1)}分`,
-      font: '13px sans-serif',
-      pixelOffset: new Cesium.Cartesian2(0, -30),
-      fillColor: Cesium.Color.WHITE,
-      outlineColor: Cesium.Color.BLACK,
-      outlineWidth: 3,
-      style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-      heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
-    },
-  });
-  siteEntities.push(entity);
-}
-
-function removeSite(siteId: number) {
-  const v = viewer.value!;
-  const idx = candidates.value.findIndex(s => s.id === siteId);
-  if (idx >= 0) {
-    const siteName = candidates.value[idx].name;
-    candidates.value.splice(idx, 1);
-    const entityIdx = siteEntities.findIndex(e => e.id === `site-${siteId}`);
-    if (entityIdx >= 0) {
-      v.entities.remove(siteEntities[entityIdx]);
-      siteEntities.splice(entityIdx, 1);
-    }
-    updateRanks();
-    statusText.value = `已删除「${siteName}」，当前共 ${candidates.value.length} 个候选点。`;
-  }
-}
-
-function flyToSite(siteId: number) {
-  const v = viewer.value!;
-  const entity = siteEntities.find(e => e.id === `site-${siteId}`);
-  if (entity) {
-    v.flyTo(entity, {
-      offset: new Cesium.HeadingPitchRange(0, -Math.PI / 4, 3000),
-    });
-  }
-}
-
-function clearAll() {
-  const v = viewer.value!;
-  siteEntities.forEach(e => v.entities.remove(e));
-  siteEntities = [];
-  candidates.value = [];
-  siteIdCounter = 0;
-}
-
+watch([candidates, factors], updateMarkers, { deep: true });
 function applyAdd() {
-  activeFeature.value = 'add-site';
-  startPicking();
-}
-
-function applyClear() {
-  activeFeature.value = 'clear';
-  picking = false;
-  clearAll();
-  statusText.value = "已清除所有候选点，点击「添加候选点」重新开始选址分析。";
-}
-
-function resetWeights() {
-  factors.value.forEach(f => f.weight = 20);
-}
-
-const codeMap: Record<'add-site' | 'clear', () => string> = {
-  'add-site': () => `// 1. 点击添加候选点
-handler.setInputAction((click) => {
-  const cartesian = viewer.scene.pickPosition(click.position);
-  addCandidateSite(cartesian);
-}, ScreenSpaceEventType.LEFT_CLICK);
-
-// 2. 生成因子得分（基于经纬度的确定性伪随机）
-const seed = Math.abs(Math.sin(lon * 12.9898 + lat * 78.233) * 43758.5453);
-factors.forEach((f, idx) => {
-  scores[f.key] = Math.abs(Math.sin(seed * (idx + 1) * 1.7)) * 100;
-});
-
-// 3. 加权综合得分计算
-function calculateTotalScore(scores) {
-  const totalWeight = factors.reduce((s, f) => s + f.weight, 0);
-  let weightedSum = 0;
-  factors.forEach(f => {
-    weightedSum += scores[f.key] * f.weight;
+  if (!ready.value) return;
+  analysis.pick(position => {
+    if (candidates.value.some(s => Cesium.Cartesian3.distance(s.position, position) < 1)) {
+      statusText.value = '已有候选点位于该位置，请编辑原候选点'; return;
+    }
+    if (candidates.value.length >= 50) { statusText.value = '最多支持 50 个候选点'; return; }
+    const carto = Cesium.Cartographic.fromCartesian(position);
+    const site: Candidate = { id: ++counter, name: '候选点' + counter, position,
+      longitude: Cesium.Math.toDegrees(carto.longitude), latitude: Cesium.Math.toDegrees(carto.latitude),
+      scores: Object.fromEntries(factors.value.map(f => [f.key, null])) };
+    candidates.value.push(site); selectedId.value = site.id;
+    markers.set(site.id, analysis.add({ position,
+      point: { pixelSize: 13, color: Cesium.Color.GRAY, heightReference: Cesium.HeightReference.CLAMP_TO_GROUND },
+      label: { text: site.name + '\n待评分', font: '12px sans-serif', pixelOffset: new Cesium.Cartesian2(0, -27),
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND, disableDepthTestDistance: Number.POSITIVE_INFINITY },
+    }));
+    statusText.value = site.name + ' 已添加，请在右侧录入各因子评分；可继续添加候选点';
   });
-  return weightedSum / totalWeight;
+  statusText.value = '点击添加候选点，评分依据需由调查资料提供';
 }
-
-// 4. 等级划分
-function getGrade(score) {
-  if (score >= 80) return '优秀';   // 绿色
-  if (score >= 60) return '良好';   // 蓝色
-  if (score >= 40) return '一般';   // 橙色
-  return '较差';                      // 红色
-}`,
-  'clear': () => `// 清除所有候选点
-siteEntities.forEach(e => viewer.entities.remove(e));
-siteEntities = [];
-candidates = [];
-siteIdCounter = 0;`,
-};
-
-const explainMap: Record<'add-site' | 'clear', () => string> = {
-  'add-site': () => `【原理】选址分析 = 多因子评价 + 加权综合 + 等级排名：
-1. 用户在地图上点击添加候选点，系统基于经纬度生成各因子模拟得分
-2. 评价因子包括：地形适宜性、交通便利性、基础设施、环境质量、人口密度
-3. 每个因子设置权重（默认各20%），加权求和得到综合得分
-4. 综合得分按等级划分：优秀(≥80)、良好(≥60)、一般(≥40)、较差(<40)
-5. 候选点按综合得分排名，颜色编码直观展示适宜性等级
-6. 权重变化时实时重新计算所有候选点得分和排名
-
-【API】
-• scene.pickPosition: 从屏幕坐标获取三维空间坐标
-• Entity.point: 点实体，color 根据得分等级动态变化
-• HeightReference.CLAMP_TO_GROUND: 标签贴地显示
-• watch(factors, { deep: true }): 深度监听权重变化，触发重算
-• 加权评分公式: score = Σ(因子得分 × 权重) / Σ权重`,
-  'clear': () => `【原理】清除 = 批量移除实体 + 重置数据：
-1. 遍历 siteEntities 数组，逐个移除候选点实体
-2. 重置 candidates、siteIdCounter 等数据
-
-【要点】清除操作会移除所有候选点，不可撤销。`,
-};
-
-const { code, explanation } = useCodeExplain(codeMap, explainMap, activeFeature);
+function stopPicking() { picking.value = false; statusText.value = '已停止添加，可编辑评分和权重'; }
+function removeSite(id: number) {
+  analysis.remove(markers.get(id)); markers.delete(id);
+  candidates.value = candidates.value.filter(s => s.id !== id);
+  if (selectedId.value === id) selectedId.value = candidates.value[0]?.id ?? null;
+  statusText.value = '已删除候选点，排名已更新';
+}
+function flyToSite(id: number) {
+  const site = candidates.value.find(s => s.id === id);
+  if (!site || !viewer.value) return;
+  viewer.value.camera.flyToBoundingSphere(new Cesium.BoundingSphere(site.position, 1), {
+    offset: new Cesium.HeadingPitchRange(0, -Math.PI / 3, 3000),
+  });
+}
+function applyClear() {
+  analysis.clear(); candidates.value = []; selectedId.value = null; markers.clear(); counter = 0;
+  statusText.value = '已清除所有候选点，当前权重保留';
+}
+function resetWeights() { factors.value.forEach(f => { f.weight = 20; }); }
+const { code, explanation } = useCodeExplain({ analyze: () => `// 原始评分由用户根据调查资料录入，未填数据为 null
+const total = weightedScore(scores, weights)
+// total = Σ(score × weight) / Σ(weight)
+// 有效权重之和必须大于 0；非零权重的因子都必须有 0–100 分
+// 空评分、无效权重不参与排名；同分采用并列排名
+entity.point.color = new ConstantProperty(scoreColor)
+entity.label.text = new ConstantProperty(labelText)` }, {
+  analyze: () => `【模型】五个因子的人工加权评价，分数统一为越高越适宜。人口因子须先按项目需求转化为适宜性评分，非人口数量。
+【评分】每因子 0–100 分；权重为 0 的因子可不评分。未完成有效评分时不生成总分、等级或排名。
+【权重】按权重总和自动归一化，无须恰好为 100；全零、空值或非法权重会使结果无效。
+【排名】优秀≥80、良好≥60、一般≥40、较差<40；同分并列。权重或评分改变后，地图和排名同步更新。
+【范围】这里演示评价模型，不自动采集真实地理因子数据。结果依赖输入资料和项目评价标准。`,
+}, activeFeature);
 </script>
 
 <template>
   <div class="flex h-full flex-col gap-3 p-4">
     <div class="flex flex-wrap items-center gap-2">
-      <n-button size="small" type="success" @click="applyAdd">添加候选点</n-button>
-      <n-button size="small" quaternary @click="applyClear">清除</n-button>
+      <n-button size="small" type="success" :disabled="!ready" @click="applyAdd">添加候选点</n-button>
+      <n-button size="small" :disabled="!picking" @click="stopPicking">停止添加</n-button>
+      <n-button size="small" quaternary @click="applyClear">清除全部</n-button>
     </div>
-
-    <SplitViewer
-      :title="activeFeature"
-      :code="code"
-      :explanation="explanation"
-      :default-split-size="70"
-      storage-key="site-selection-split"
-    >
+    <SplitViewer title="选址分析" :code="code" :explanation="explanation" storage-key="site-selection-split">
       <template #scene-overlay>
-        <div class="absolute left-3 top-3 z-10 max-w-[70%] rounded bg-black/60 px-3 py-1.5 text-xs text-white">
-          {{ statusText }}
+        <div class="absolute left-3 top-3 z-10 max-w-[80%] rounded bg-black/70 px-3 py-2 text-xs text-white">
+          <div>{{ statusText }}</div><div class="mt-1 text-white/70">{{ terrainNote }}</div>
         </div>
       </template>
-
-    <template #bottom-panel>
-      <div class="border-t border-gray-200 bg-gray-50 p-4">
-        <!-- 权重设置 -->
-        <div class="mb-4">
-          <div class="mb-2 flex items-center justify-between">
-            <span class="text-sm font-semibold text-gray-700">评价因子权重</span>
-            <n-button size="tiny" quaternary @click="resetWeights">重置为20%</n-button>
+      <template #bottom-panel>
+        <div class="max-h-[52vh] shrink-0 space-y-3 overflow-auto border-t bg-gray-50 p-3 text-xs">
+          <div class="flex items-center justify-between"><b>因子权重（自动归一化）</b><n-button size="tiny" @click="resetWeights">重置权重</n-button></div>
+          <div class="grid grid-cols-2 gap-2">
+            <label v-for="factor in factors" :key="factor.key">{{ factor.name }}
+              <n-input-number v-model:value="factor.weight" :min="0" :max="100" size="small" />
+            </label>
           </div>
-          <div class="grid grid-cols-5 gap-2">
-            <div v-for="factor in factors" :key="factor.key" class="text-center">
-              <div class="mb-1 text-xs text-gray-600">{{ factor.name }}</div>
-              <n-input-number
-                v-model:value="factor.weight"
-                :min="0"
-                :max="100"
-                size="tiny"
-                style="width: 100%"
-              />
-            </div>
+          <div :class="weightsValid ? 'text-gray-500' : 'text-red-600'">权重总和 {{ totalWeight }}；{{ weightsValid ? '有效权重已归一化' : '请填写有效权重，至少一项大于零' }}</div>
+          <n-select v-model:value="selectedId" :options="siteOptions" placeholder="选择候选点录入评分" size="small" />
+          <div v-if="selectedSite" class="grid grid-cols-2 gap-2">
+            <label v-for="factor in factors" :key="factor.key">{{ factor.name }}评分
+              <n-input-number v-model:value="selectedSite.scores[factor.key]" :min="0" :max="100" :step="1" size="small" placeholder="0–100分" />
+            </label>
           </div>
-          <div class="mt-1 text-right text-xs text-gray-400">权重总和: {{ totalWeight }}%</div>
-        </div>
-
-        <!-- 候选点排名 -->
-        <div class="mb-2 text-sm font-semibold text-gray-700">候选点排名（共 {{ candidates.length }} 个）</div>
-        <div v-if="candidates.length === 0" class="py-4 text-center text-xs text-gray-400">
-          暂无候选点，点击「添加候选点」在地图上选择位置
-        </div>
-        <div v-else class="max-h-48 space-y-2 overflow-auto">
-          <div
-            v-for="site in rankedCandidates"
-            :key="site.id"
-            class="rounded-lg border border-gray-200 bg-white p-2"
-          >
-            <div class="flex items-center gap-2">
-              <span
-                class="inline-flex h-6 w-6 items-center justify-center rounded-full text-xs font-bold text-white"
-                :style="{ backgroundColor: getGradeColor(site.totalScore) }"
-              >{{ site.rank }}</span>
-              <span class="text-xs font-semibold text-gray-700">{{ site.name }}</span>
-              <span class="text-xs text-gray-500">
-                {{ site.longitude.toFixed(4) }}°E, {{ site.latitude.toFixed(4) }}°N
-              </span>
-              <span class="ml-auto text-sm font-bold" :style="{ color: getGradeColor(site.totalScore) }">
-                {{ site.totalScore.toFixed(1) }}分
-              </span>
-              <span
-                class="rounded px-1.5 py-0.5 text-xs text-white"
-                :style="{ backgroundColor: getGradeColor(site.totalScore) }"
-              >{{ site.grade }}</span>
-              <n-button size="tiny" type="primary" quaternary @click="flyToSite(site.id)">定位</n-button>
-              <n-button size="tiny" type="error" quaternary @click="removeSite(site.id)">删除</n-button>
+          <div class="font-semibold">候选点排名 · {{ candidates.length }} 个</div>
+          <div v-for="site in rankedCandidates" :key="site.id" class="rounded border bg-white p-2">
+            <div class="flex flex-wrap items-center gap-2">
+              <span :style="{ color: color(site.totalScore) }">{{ site.rank === null ? '—' : '第' + site.rank + '名' }} {{ site.name }} · {{ site.totalScore === null ? grade(null) : site.totalScore.toFixed(1) + '分 · ' + grade(site.totalScore) }}</span>
+              <n-button size="tiny" @click="selectedId = site.id">评分</n-button>
+              <n-button size="tiny" @click="flyToSite(site.id)">定位</n-button>
+              <n-button size="tiny" quaternary type="error" @click="removeSite(site.id)">删除</n-button>
             </div>
-            <!-- 各因子得分条 -->
-            <div class="mt-2 grid grid-cols-5 gap-1">
-              <div v-for="factor in factors" :key="factor.key" class="text-center">
-                <div class="h-1.5 w-full overflow-hidden rounded-full bg-gray-200">
-                  <div
-                    class="h-full rounded-full"
-                    :style="{ width: site.scores[factor.key] + '%', backgroundColor: factor.color }"
-                  ></div>
-                </div>
-                <div class="mt-0.5 text-xs text-gray-500">{{ site.scores[factor.key].toFixed(0) }}</div>
-              </div>
-            </div>
+            <div class="mt-1 text-gray-500">{{ site.longitude.toFixed(5) }}°，{{ site.latitude.toFixed(5) }}°</div>
           </div>
+          <div v-if="!candidates.length">暂无候选点；点击地图添加后录入调查评分。</div>
         </div>
-      </div>
-    </template>
+      </template>
     </SplitViewer>
   </div>
 </template>

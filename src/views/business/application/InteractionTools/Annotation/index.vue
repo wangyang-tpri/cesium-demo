@@ -1,540 +1,166 @@
 <script setup lang="ts">
-import { ref, provide, onBeforeUnmount, watch, nextTick } from "vue";
-import * as Cesium from "cesium";
-import SplitViewer from "@/components/base/SplitViewer.vue";
-import { useCesiumViewer } from "@/hooks/useCesiumViewer";
-import { useCodeExplain } from "@/hooks/useCodeExplain";
+import * as Cesium from 'cesium';
+import { provide, ref, shallowRef } from 'vue';
+import SplitViewer from '@/components/base/SplitViewer.vue';
+import { useSpatialAnalysis } from '@/hooks/useSpatialAnalysis';
+import { useCodeExplain } from '@/hooks/useCodeExplain';
+import { annotationStyle, pickedEntityId, type AnnotationStyle } from '@/utils/mapInteraction';
 
 const containerRef = ref<HTMLDivElement | null>(null);
-provide("splitViewerContainerRef", containerRef);
-
-const { viewer } = useCesiumViewer(containerRef, {
-  baseLayer: "tianditu-img",
-  camera: { position: [108.94, 34.2, 30000], pitch: -55 },
-});
-
-type AnnotationType = "text" | "icon" | "point-label";
-const activeFeature = ref<AnnotationType | "clear" | null>(null);
-const statusText = ref("标注工具：选择标注类型，在地图上点击添加标注。");
-
-interface AnnotationItem {
-  id: number;
-  type: AnnotationType;
-  text: string;
-  entity: Cesium.Entity;
-}
-
-const annotationItems = ref<AnnotationItem[]>([]);
-let annoIdCounter = 0;
-let adding = false;
-let currentType: AnnotationType | null = null;
-let handler: Cesium.ScreenSpaceEventHandler | null = null;
-let nativeClickListener: ((e: MouseEvent) => void) | null = null;
-
-// 编辑标注
-const showEditModal = ref(false);
-const editingItem = ref<AnnotationItem | null>(null);
-const editText = ref("");
-
-// 标注样式设置
-const annotationText = ref("新建标注");
-const fontSize = ref(14);
-const fontColor = ref("#ffffff");
-const bgColor = ref("#1890ff");
-const iconEmoji = ref("📍");
-
-const annoTypes = [
-  { key: "text" as AnnotationType, label: "文字标注", icon: "📝" },
-  { key: "icon" as AnnotationType, label: "图标标注", icon: "🎯" },
-  { key: "point-label" as AnnotationType, label: "点+标签", icon: "🔖" },
+provide('splitViewerContainerRef', containerRef);
+type AnnotationType = 'text' | 'icon' | 'point-label';
+const activeFeature = ref<AnnotationType>('text');
+const analysis = useSpatialAnalysis(containerRef, '选择类型后点击添加；可通过地图或列表编辑已有标注。');
+const { viewer, ready, picking, statusText, terrainNote } = analysis;
+const annoTypes: { key: AnnotationType; label: string }[] = [
+  { key: 'text', label: '文字标注' }, { key: 'icon', label: '图标标注' }, { key: 'point-label', label: '点+标签' },
 ];
+interface AnnotationItem { id: number; type: AnnotationType; style: AnnotationStyle; position: Cesium.Cartesian3; entity: Cesium.Entity }
+const annotationItems = shallowRef<AnnotationItem[]>([]);
+let counter = 0;
+const annotationText = ref('新建标注');
+const fontSize = ref<number | null>(16);
+const fontColor = ref('#ffffff');
+const bgColor = ref('#1890ff');
+const iconEmoji = ref('📍');
+const showEditModal = ref(false);
+const editingId = ref<number | null>(null);
+const editForm = ref({ text: '', fontSize: 16 as number | null, color: '#ffffff', background: '#1890ff' });
 
+function labelOptions(type: AnnotationType, style: AnnotationStyle): Cesium.LabelGraphics.ConstructorOptions {
+  return { text: style.text, font: style.fontSize + 'px sans-serif',
+    fillColor: Cesium.Color.fromCssColorString(style.color),
+    showBackground: type !== 'icon',
+    backgroundColor: Cesium.Color.fromCssColorString(style.background),
+    pixelOffset: type === 'point-label' ? new Cesium.Cartesian2(0, -24) : Cesium.Cartesian2.ZERO,
+    verticalOrigin: Cesium.VerticalOrigin.CENTER, style: Cesium.LabelStyle.FILL,
+    heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+    distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 200000),
+    disableDepthTestDistance: Number.POSITIVE_INFINITY,
+  };
+}
 function selectType(type: AnnotationType) {
-  stopAdding();
-  currentType = type;
+  if (!ready.value) return;
   activeFeature.value = type;
-  startAdding();
-  const names: Record<AnnotationType, string> = {
-    text: "文字标注",
-    icon: "图标标注",
-    "point-label": "点+标签",
-  };
-  statusText.value = `已选择「${names[type]}」，点击地图添加标注。`;
+  analysis.pick(position => {
+    if (annotationItems.value.length >= 200) { statusText.value = '最多保留 200 个标注，请删除或清除后继续'; return; }
+    try {
+      const style = annotationStyle({ text: type === 'icon' ? iconEmoji.value : annotationText.value,
+        fontSize: fontSize.value, color: fontColor.value, background: bgColor.value });
+      const entity = analysis.add({ position, label: labelOptions(type, style),
+        ...(type === 'point-label' ? { point: { pixelSize: 10, color: Cesium.Color.RED,
+          outlineColor: Cesium.Color.WHITE, outlineWidth: 2, heightReference: Cesium.HeightReference.CLAMP_TO_GROUND } } : {}),
+      });
+      const id = ++counter;
+      annotationItems.value = [...annotationItems.value, { id, type, style, position, entity }];
+      statusText.value = '已添加标注 #' + id + '：' + style.text;
+    } catch (error) { statusText.value = error instanceof Error ? error.message : '标注样式无效'; }
+  }, { beforePick: pixel => {
+    if (showEditModal.value) return true;
+    const id = pickedEntityId(viewer.value?.scene.pick(pixel));
+    const item = annotationItems.value.find(annotation => annotation.entity.id === id);
+    if (!item) return false;
+    openEditModal(item); return true;
+  } });
+  statusText.value = '已开启' + annoTypes.find(t => t.key === type)!.label + '添加，点击已有标注可编辑';
 }
-
-function startAdding() {
-  const v = viewer.value;
-  if (!v || !v.scene || !v.scene.canvas) {
-    statusText.value = "地图初始化中，请稍候再试...";
-    return;
-  }
-  adding = true;
-  // 先移除旧的监听器，避免重复绑定
-  if (nativeClickListener) {
-    v.scene.canvas.removeEventListener("click", nativeClickListener);
-    nativeClickListener = null;
-  }
-
-  nativeClickListener = (e: MouseEvent) => {
-    const canvas = v.scene.canvas;
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const windowPos = new Cesium.Cartesian2(x, y);
-
-    // 先检查是否点击到了已有标注 entity，如果是则打开编辑
-    const picked = v.scene.pick(windowPos);
-    if (picked && picked.id) {
-      // 兼容 Cesium 不同版本：picked.id 可能是 Entity 或包含 id 的对象
-      const pickedEntity =
-        picked.id instanceof Cesium.Entity ? picked.id : (picked.id as any).id;
-      if (pickedEntity) {
-        const clickedItem = annotationItems.value.find(
-          (item) => item.entity === pickedEntity
-        );
-        if (clickedItem) {
-          openEditModal(clickedItem);
-          return;
-        }
-      }
-    }
-
-    // 否则添加新标注
-    const ray = v.camera.getPickRay(windowPos);
-    if (!ray) return;
-    const cartesian = v.scene.globe.pick(ray, v.scene);
-    if (!cartesian) return;
-    addAnnotation(cartesian);
-  };
-  v.scene.canvas.addEventListener("click", nativeClickListener);
-}
-
-// viewer 可能被多次创建/销毁（如 SplitViewer 容器变化），需要重新绑定事件
-watch(
-  () => viewer.value,
-  (newV, oldV) => {
-    // viewer 被销毁时，移除旧监听器
-    if (!newV && oldV) {
-      if (nativeClickListener && oldV.scene?.canvas) {
-        oldV.scene.canvas.removeEventListener("click", nativeClickListener);
-        nativeClickListener = null;
-      }
-    }
-    // viewer 就绪且处于添加模式时，重新绑定事件
-    if (newV && adding) {
-      nextTick(() => startAdding());
-    }
-  },
-  { immediate: true }
-);
-
-function stopAdding() {
-  adding = false;
-  if (handler) {
-    handler.destroy();
-    handler = null;
-  }
-  const v = viewer.value;
-  if (v && v.scene && v.scene.canvas && nativeClickListener) {
-    v.scene.canvas.removeEventListener("click", nativeClickListener);
-    nativeClickListener = null;
-  }
-}
-
-function addAnnotation(position: Cesium.Cartesian3) {
-  const v = viewer.value;
-  if (!v || !currentType) return;
-  const id = ++annoIdCounter;
-  let entity: Cesium.Entity;
-  let name = "";
-
-  if (currentType === "text") {
-    name = `文字${id}`;
-    entity = v.entities.add({
-      position,
-      label: {
-        text: annotationText.value || name,
-        font: `${fontSize.value}px sans-serif`,
-        fillColor: Cesium.Color.fromCssColorString(fontColor.value),
-        backgroundColor: Cesium.Color.fromCssColorString(
-          bgColor.value
-        ).withAlpha(0.85),
-        showBackground: true,
-        style: Cesium.LabelStyle.FILL,
-        verticalOrigin: Cesium.VerticalOrigin.CENTER,
-      },
-    });
-  } else if (currentType === "icon") {
-    name = `图标${id}`;
-    entity = v.entities.add({
-      position,
-      label: {
-        text: iconEmoji.value,
-        font: `${fontSize.value + 10}px sans-serif`,
-        verticalOrigin: Cesium.VerticalOrigin.CENTER,
-      },
-    });
-  } else {
-    name = `点标${id}`;
-    entity = v.entities.add({
-      position,
-      point: {
-        pixelSize: 10,
-        color: Cesium.Color.RED,
-        outlineColor: Cesium.Color.WHITE,
-        outlineWidth: 2,
-      },
-      label: {
-        text: annotationText.value || name,
-        font: `${fontSize.value}px sans-serif`,
-        pixelOffset: new Cesium.Cartesian2(0, -22),
-        fillColor: Cesium.Color.fromCssColorString(fontColor.value),
-        backgroundColor: Cesium.Color.fromCssColorString(
-          bgColor.value
-        ).withAlpha(0.85),
-        showBackground: true,
-        style: Cesium.LabelStyle.FILL,
-      },
-    });
-  }
-
-  annotationItems.value.push({
-    id,
-    type: currentType,
-    text: annotationText.value,
-    entity,
-  });
-  statusText.value = `已添加${name}`;
-}
-
-function applyClear() {
-  activeFeature.value = "clear";
-  stopAdding();
-  if (handler) {
-    handler.destroy();
-    handler = null;
-  }
-  const v = viewer.value;
-  if (v) {
-    annotationItems.value.forEach((item) => v.entities.remove(item.entity));
-  }
-  annotationItems.value = [];
-  annoIdCounter = 0;
-  statusText.value = "已清除所有标注，选择类型重新添加。";
-}
-
-function removeItem(item: AnnotationItem) {
-  const v = viewer.value;
-  if (v) v.entities.remove(item.entity);
-  annotationItems.value = annotationItems.value.filter((i) => i.id !== item.id);
-  statusText.value = `已删除标注 #${item.id}`;
-}
-
-function flyToItem(item: AnnotationItem) {
-  const v = viewer.value;
-  if (!v) return;
-  const pos = item.entity.position?.getValue(v.clock.currentTime);
-  if (!pos) return;
-  const carto = Cesium.Cartographic.fromCartesian(pos);
-  v.camera.flyTo({
-    destination: Cesium.Cartesian3.fromRadians(
-      carto.longitude,
-      carto.latitude,
-      5000
-    ),
-    orientation: {
-      heading: Cesium.Math.toRadians(0),
-      pitch: Cesium.Math.toRadians(-45),
-      roll: 0,
-    },
-    duration: 1.5,
-  });
-}
-
+function stopAdding() { picking.value = false; statusText.value = '已停止添加，可通过地图或列表编辑已有标注'; }
 function openEditModal(item: AnnotationItem) {
-  editingItem.value = item;
-  editText.value = item.text;
-  showEditModal.value = true;
+  picking.value = false; editingId.value = item.id;
+  editForm.value = { ...item.style }; showEditModal.value = true;
+  statusText.value = '正在编辑标注 #' + item.id + '，添加已暂停';
 }
-
+function cancelEdit() { showEditModal.value = false; editingId.value = null; }
+function onEditClosed() { if (!showEditModal.value) editingId.value = null; }
 function saveEdit() {
-  if (!editingItem.value) return;
-  const item = editingItem.value;
-  item.text = editText.value;
-  // 更新 entity 的 label 文字
-  if (item.entity.label) {
-    (item.entity.label as any).text = editText.value;
+  const item = annotationItems.value.find(annotation => annotation.id === editingId.value);
+  if (!item) { cancelEdit(); statusText.value = '该标注已被删除'; return false; }
+  try {
+    const style = annotationStyle(editForm.value);
+    item.entity.label = new Cesium.LabelGraphics(labelOptions(item.type, style));
+    annotationItems.value = annotationItems.value.map(annotation => annotation.id === item.id ? { ...annotation, style } : annotation);
+    cancelEdit(); statusText.value = '已更新标注 #' + item.id + ' 的内容和样式';
+  } catch (error) {
+    statusText.value = error instanceof Error ? error.message : '标注样式无效';
+    return false;
   }
-  showEditModal.value = false;
-  editingItem.value = null;
-  statusText.value = `已更新标注 #${item.id} 的文字`;
 }
-
-function cancelEdit() {
-  showEditModal.value = false;
-  editingItem.value = null;
+function removeItem(item: AnnotationItem) {
+  if (editingId.value === item.id) cancelEdit();
+  analysis.remove(item.entity);
+  annotationItems.value = annotationItems.value.filter(annotation => annotation.id !== item.id);
+  statusText.value = '已删除标注 #' + item.id;
 }
-
-onBeforeUnmount(() => {
-  stopAdding();
-  if (handler) handler.destroy();
-  const v = viewer.value;
-  if (v) {
-    annotationItems.value.forEach((item) => v.entities.remove(item.entity));
-  }
-});
-
-const codeMap: Record<AnnotationType | "clear", () => string> = {
-  text: () => `// 文字标注
-viewer.entities.add({
-  position: cartesian,
-  label: {
-    text: '标注文字',
-    font: '14px sans-serif',
-    fillColor: Color.WHITE,
-    backgroundColor: Color.fromCssColorString('#1890ff').withAlpha(0.85),
-    showBackground: true,
-    padding: new Cartesian2(10, 6),
-    style: LabelStyle.FILL,
-    verticalOrigin: VerticalOrigin.CENTER,
-  },
-});`,
-  icon: () => `// 图标标注（使用 emoji 作为图标）
-viewer.entities.add({
-  position: cartesian,
-  label: {
-    text: '📍',
-    font: '24px sans-serif',
-    verticalOrigin: VerticalOrigin.CENTER,
-  },
-});
-
-// 也可以使用 billboard 加载图片图标
-viewer.entities.add({
-  position: cartesian,
-  billboard: {
-    image: 'icon.png',
-    width: 32, height: 32,
-    verticalOrigin: VerticalOrigin.BOTTOM,
-  },
-});`,
-  "point-label": () => `// 点+标签组合标注
-viewer.entities.add({
-  position: cartesian,
-  point: {
-    pixelSize: 10,
-    color: Color.RED,
-    outlineColor: Color.WHITE,
-    outlineWidth: 2,
-  },
-  label: {
-    text: '标签文字',
-    font: '14px sans-serif',
-    pixelOffset: new Cartesian2(0, -22),
-    fillColor: Color.WHITE,
-    backgroundColor: Color.fromCssColorString('#1890ff').withAlpha(0.85),
-    showBackground: true,
-    padding: new Cartesian2(8, 4),
-  },
-});`,
-  clear: () => `// 清除所有标注
-annotationItems.forEach(item => viewer.entities.remove(item.entity));
-annotationItems = [];
-if (handler) { handler.destroy(); handler = null; }`,
-};
-
-const explainMap: Record<AnnotationType | "clear", () => string> = {
-  text: () => `【原理】文字标注 = label 实体 + 背景样式：
-1. 使用 Entity.label 添加文字标注
-2. text 设置标注内容，font 设置字体大小和样式
-3. fillColor 文字颜色，backgroundColor + showBackground 背景色
-4. padding 内边距，style 文字样式（FILL/OUTLINE/FILL_AND_OUTLINE）
-5. verticalOrigin 垂直对齐方式
-
-【API】
-• Entity.label: 标签实体
-• LabelStyle: 标签样式枚举
-• VerticalOrigin: 垂直对齐枚举`,
-  icon: () => `【原理】图标标注 = emoji label 或 billboard 图片：
-1. 简单方式：使用 label 的 text 属性设置 emoji 字符作为图标
-2. 专业方式：使用 billboard 加载外部图片资源
-3. billboard 支持 width/height 缩放、verticalOrigin 对齐
-4. emoji 方式无需额外资源，billboard 方式支持自定义图标
-
-【API】
-• Entity.label: 标签实体（emoji 方式）
-• Entity.billboard: 广告牌实体（图片方式）
-• billboard.image: 图片URL或Canvas`,
-  "point-label": () => `【原理】点+标签 = point 实体 + label 实体组合：
-1. point 实体在地图上绘制标记点
-2. label 实体在点的上方显示文字标签
-3. pixelOffset 控制标签相对于点的偏移量（y负值向上偏移）
-4. 两者共享同一个 position，自动跟随点移动
-
-【API】
-• Entity.point: 点实体
-• Entity.label: 标签实体
-• pixelOffset: 像素偏移量（Cartesian2）`,
-  clear: () => `【原理】清除 = 批量移除实体 + 销毁事件处理器：
-1. 遍历 annotationItems，逐个移除实体
-2. 重置计数器和列表
-3. 销毁 ScreenSpaceEventHandler
-
-【要点】清除操作不可撤销。`,
-};
-
-const { code, explanation } = useCodeExplain(
-  codeMap,
-  explainMap,
-  activeFeature
-);
+function flyToItem(item: AnnotationItem) {
+  picking.value = false;
+  viewer.value?.camera.flyToBoundingSphere(new Cesium.BoundingSphere(item.position, 1), {
+    offset: new Cesium.HeadingPitchRange(0, -Math.PI / 3, 1500), duration: 1.2,
+  });
+  statusText.value = '定位标注 #' + item.id + '，添加已暂停';
+}
+function applyClear() {
+  cancelEdit(); analysis.clear(); viewer.value?.camera.cancelFlight(); annotationItems.value = []; counter = 0;
+  statusText.value = '已清除所有标注，添加已停止';
+}
+const annotationCode = () => `// 使用同一套屏幕事件，避免浏览器原生 click 将拖动误判为添加
+const id = pickedEntityId(viewer.scene.pick(pixel))
+const item = items.find(item => item.entity.id === id)
+if (item) openEditModal(item)
+else addAnnotation(groundPosition)
+// 数据与地图统一使用实际内容，图标类型保存 emoji 本身
+item.entity.label = new LabelGraphics(labelOptions(type, editedStyle))`;
+const annotationExplanation = () => `【类型】文字标注、emoji图标、点与标签组合，全部贴地显示。
+【样式】顶部设置只影响新标注。已有标注通过地图点击或列表编辑按钮修改内容、字号和颜色。
+【一致性】图标保存实际emoji；列表、地图与编辑框共享同一份样式。空内容、过长内容、无效字号和颜色会被拒绝。
+【操作】停止添加后仍可编辑已有标注；定位会暂停添加；清除会同时关闭编辑框。切换页面销毁事件处理器，最多200个标注。
+【图标】使用系统字体中的emoji，不需要下载外部图标；显示外观随系统字体而异。`;
+const { code, explanation } = useCodeExplain({ text: annotationCode, icon: annotationCode, 'point-label': annotationCode },
+  { text: annotationExplanation, icon: annotationExplanation, 'point-label': annotationExplanation }, activeFeature);
 </script>
 
 <template>
   <div class="flex h-full flex-col gap-3 p-4">
     <div class="flex flex-wrap items-center gap-2">
-      <n-button
-        v-for="t in annoTypes"
-        :key="t.key"
-        size="small"
-        :type="activeFeature === t.key ? 'primary' : 'default'"
-        @click="selectType(t.key)"
-      >
-        {{ t.icon }} {{ t.label }}
-      </n-button>
+      <n-button v-for="type in annoTypes" :key="type.key" size="small" :disabled="!ready"
+        :type="picking && activeFeature === type.key ? 'primary' : 'default'" @click="selectType(type.key)">{{ type.label }}</n-button>
+      <n-button size="small" :disabled="!picking" @click="stopAdding">停止添加</n-button>
       <n-button size="small" quaternary @click="applyClear">清除</n-button>
     </div>
-
-    <!-- 样式设置 -->
-    <div
-      class="flex flex-wrap items-center gap-4 rounded border border-gray-200 bg-gray-50 px-4 py-2 text-xs"
-    >
-      <div class="flex items-center gap-2">
-        <span class="text-gray-600">文字:</span>
-        <n-input
-          v-model:value="annotationText"
-          size="small"
-          placeholder="标注文字"
-          style="width: 120px"
-        />
-      </div>
-      <div class="flex items-center gap-2">
-        <span class="text-gray-600">字号:</span>
-        <n-input-number
-          v-model:value="fontSize"
-          size="small"
-          :min="10"
-          :max="32"
-          style="width: 100px"
-        />
-      </div>
-      <div class="flex items-center gap-2">
-        <span class="text-gray-600">字色:</span>
-        <n-color-picker
-          v-model:value="fontColor"
-          size="small"
-          :modes="['hex']"
-          style="width: 100px"
-        />
-      </div>
-      <div class="flex items-center gap-2">
-        <span class="text-gray-600">背景:</span>
-        <n-color-picker
-          v-model:value="bgColor"
-          size="small"
-          :modes="['hex']"
-          style="width: 100px"
-        />
-      </div>
-      <div v-if="activeFeature === 'icon'" class="flex items-center gap-2">
-        <span class="text-gray-600">图标:</span>
-        <n-input
-          v-model:value="iconEmoji"
-          size="small"
-          placeholder="emoji"
-          style="width: 100px"
-        />
-      </div>
+    <div class="flex flex-wrap items-center gap-2 rounded border bg-gray-50 p-2 text-xs">
+      <span>{{ activeFeature === 'icon' ? '图标' : '文字' }}</span>
+      <n-input v-if="activeFeature === 'icon'" v-model:value="iconEmoji" placeholder="图标或emoji" size="small" style="width: 125px" />
+      <n-input v-else v-model:value="annotationText" placeholder="新标注文字" size="small" style="width: 150px" />
+      <span>字号</span><n-input-number v-model:value="fontSize" :min="10" :max="48" size="small" style="width: 95px" />
+      <span>字色</span><n-color-picker v-model:value="fontColor" :modes="['hex']" size="small" style="width: 100px" />
+      <span>背景</span><n-color-picker v-model:value="bgColor" :modes="['hex']" size="small" style="width: 100px" />
+      <span class="text-gray-500">此处设置仅用于新标注</span>
     </div>
-
-    <SplitViewer
-      :title="activeFeature ?? ''"
-      :code="code"
-      :explanation="explanation"
-      :default-split-size="70"
-      storage-key="annotation-split"
-    >
+    <SplitViewer title="标注工具" :code="code" :explanation="explanation" storage-key="annotation-split">
       <template #scene-overlay>
-        <div
-          class="absolute left-3 top-3 z-10 max-w-[70%] rounded bg-black/60 px-3 py-1.5 text-xs text-white"
-        >
-          {{ statusText }}
+        <div class="absolute left-3 top-3 z-10 max-w-[80%] rounded bg-black/70 px-3 py-2 text-xs text-white">
+          <div>{{ statusText }}</div><div class="mt-1 text-white/70">{{ terrainNote }}</div>
         </div>
       </template>
-
       <template #bottom-panel>
-        <div class="border-t border-gray-200 bg-gray-50 p-4">
-          <div class="mb-2 flex items-center justify-between">
-            <div class="text-sm font-semibold text-gray-700">标注列表</div>
-            <div class="text-xs text-gray-500">
-              共 <b class="text-blue-600">{{ annotationItems.length }}</b> 个
-            </div>
-          </div>
-          <div
-            v-if="annotationItems.length === 0"
-            class="py-4 text-center text-xs text-gray-400"
-          >
-            选择标注类型后在地图上点击添加
-          </div>
-          <div v-else class="flex max-h-32 flex-wrap gap-2 overflow-auto">
-            <div
-              v-for="item in annotationItems"
-              :key="item.id"
-              class="flex items-center gap-2 rounded border border-gray-200 bg-white px-3 py-1.5 text-xs"
-            >
-              <span class="font-medium text-gray-700"
-                >#{{ item.id }} {{ item.text || "(无文字)" }}</span
-              >
-              <n-button
-                size="tiny"
-                type="primary"
-                quaternary
-                @click="flyToItem(item)"
-                >定位</n-button
-              >
-              <n-button
-                size="tiny"
-                type="error"
-                quaternary
-                @click="removeItem(item)"
-                >删除</n-button
-              >
-            </div>
+        <div class="max-h-[40vh] shrink-0 overflow-auto border-t bg-gray-50 p-3 text-xs">
+          <b>标注列表 · {{ annotationItems.length }} 个</b>
+          <div v-for="item in annotationItems" :key="item.id" class="mt-2 flex flex-wrap items-center gap-2 rounded border bg-white p-2">
+            <span class="flex-1 break-all">#{{ item.id }} {{ item.style.text }}</span>
+            <n-button size="tiny" @click="openEditModal(item)">编辑</n-button>
+            <n-button size="tiny" @click="flyToItem(item)">定位</n-button>
+            <n-button size="tiny" type="error" quaternary @click="removeItem(item)">删除</n-button>
           </div>
         </div>
       </template>
     </SplitViewer>
-
-    <!-- 编辑标注对话框 -->
-    <n-modal
-      v-model:show="showEditModal"
-      preset="dialog"
-      title="编辑标注文字"
-      :show-icon="false"
-      positive-text="保存"
-      negative-text="取消"
-      @positive-click="saveEdit"
-      @negative-click="cancelEdit"
-    >
-      <div class="py-2">
-        <n-input
-          v-model:value="editText"
-          placeholder="请输入标注文字"
-          @keyup.enter="saveEdit"
-        />
-        <div class="mt-2 text-xs text-gray-400">
-          提示：点击地图上的标注文字可快速编辑
-        </div>
+    <n-modal v-model:show="showEditModal" preset="dialog" title="编辑标注内容和样式" :show-icon="false"
+      positive-text="保存" negative-text="取消" @positive-click="saveEdit" @negative-click="cancelEdit" @after-leave="onEditClosed">
+      <div class="space-y-3 py-2">
+        <n-input v-model:value="editForm.text" placeholder="标注内容" :maxlength="240" />
+        <div class="flex items-center gap-2"><span>字号</span><n-input-number v-model:value="editForm.fontSize" :min="10" :max="48" size="small" /></div>
+        <div class="flex items-center gap-2"><span>字色</span><n-color-picker v-model:value="editForm.color" :modes="['hex']" size="small" /></div>
+        <div class="flex items-center gap-2"><span>背景</span><n-color-picker v-model:value="editForm.background" :modes="['hex']" size="small" /></div>
+        <div class="text-xs text-gray-500">内容须为1–120个字符。图标标注编辑实际emoji内容。</div>
       </div>
     </n-modal>
   </div>

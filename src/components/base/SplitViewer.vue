@@ -31,13 +31,13 @@ const emit = defineEmits<{
 const containerRef = inject<Ref<HTMLDivElement | null>>(
   "splitViewerContainerRef"
 );
+const viewerInitializing = inject<Ref<boolean>>('cesiumViewerInitializing', ref(false));
+const viewerInitializationError = inject<Ref<string | null>>('cesiumViewerInitializationError', ref(null));
 
 // 用函数 ref 方式更新父组件传入的 containerRef
 // Vue 3.5+ 函数 ref 签名：(ref: Element | ComponentPublicInstance | null, refs: Record) => void
 function setContainerRef(el: Element | ComponentPublicInstance | null) {
-  if (containerRef && el instanceof Element) {
-    containerRef.value = el as HTMLDivElement;
-  }
+  if (containerRef) containerRef.value = el instanceof Element ? el as HTMLDivElement : null;
 }
 
 // 从 localStorage 读取或使用默认值
@@ -77,6 +77,11 @@ onBeforeUnmount(() => {
           class="relative h-full w-full overflow-hidden rounded-lg border border-gray-200 shadow-sm"
         >
           <div :ref="setContainerRef" class="h-full w-full"></div>
+          <div v-if="viewerInitializing || viewerInitializationError"
+            class="absolute inset-0 z-30 flex items-center justify-center bg-gray-900 text-sm text-white"
+            role="status" aria-live="polite">
+            {{ viewerInitializationError ? '地图初始化失败，请重新进入页面重试' : '正在准备地图与地形…' }}
+          </div>
           <!-- 左侧场景覆盖层 slot：状态文本、工具栏、图例等 -->
           <slot name="scene-overlay"></slot>
           <!-- 右下角：实时缩放层级和相机高度 -->

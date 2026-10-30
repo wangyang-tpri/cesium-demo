@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "meta": {
+    "createdBy": "light-mind-map",
+    "createdAt": "2026-09-14T00:50:42.361Z"
+  },
+  "root": {
+    "id": "nmu0j1261b9khmd",
+    "text": "测试数据",
+    "collapsed": false,
+    "children": [
+      {
+        "id": "nmu0j19xqj7p2dp",
+        "text": "5050505055505050505050500505005050505050505050050055005000505055050505505055050050550550505050550505\n050505050",
+        "collapsed": false,
+        "children": [],
+        "_w": 771,
+        "_h": 50,
+        "_subtreeHeight": 50,
+        "_x": 152,
+        "_y": 0,
+        "_side": "right",
+        "_rx": 212,
+        "_ry": 60
+      },
+      {
+        "id": "nmu0j1aysacsmm3",
+        "text": "",
+        "collapsed": false,
+        "children": [],
+        "_w": 30,
+        "_h": 30,
+        "_subtreeHeight": 30,
+        "_x": 152,
+        "_y": 58,
+        "_side": "right",
+        "_rx": 212,
+        "_ry": 118
+      }
+    ],
+    "_w": 72,
+    "_h": 30,
+    "_subtreeHeight": 88,
+    "_x": 0,
+    "_y": 29,
+    "_side": "root",
+    "_rx": 60,
+    "_ry": 89
+  }
+}
